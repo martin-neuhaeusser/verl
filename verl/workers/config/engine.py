@@ -699,6 +699,7 @@ class TrainingWorkerConfig(BaseConfig):
     # Users can pass in a higher-order function to take more parameters
     auto_select_engine_optim_fn: Callable[["HFModelConfig", str], tuple["EngineConfig", "OptimizerConfig"]] = None
     extra_context: dict = field(default_factory=dict)
-    # Token ids the rollout backend never samples; the engine excludes them from the policy it evaluates.
-    # Set by ActorRolloutRefWorker for the actor and the reference model, None for every other use.
+    # The token ids that the rollout backend excludes from sampling. The engine sets their logits to -inf
+    # before computing log-probabilities and entropy (see BaseEngine.set_rollout_vocab_mask).
+    # ActorRolloutRefWorker sets it for the actor and the reference model; None for every other use.
     rollout_vocab_mask: Optional[RolloutVocabMask] = None

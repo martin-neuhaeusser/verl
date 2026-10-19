@@ -496,6 +496,20 @@ def forward_with_torch_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
+    """Return the log-probability of the label and the entropy of the next-token distribution at every position.
+
+    Both are computed by ``FusedLinearForPPO`` from the hidden states of the last layer and the ``lm_head`` weight.
+
+    The arguments not listed below are those of the ``forward`` method of the Hugging Face model.
+
+    Args:
+        temperature: Positive scalar that divides the logits.
+        banned_token_mask: Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every token id whose
+            logit is set to ``-inf`` before the softmax, or ``None`` if there is no such id. Passed to
+            :meth:`verl.utils.experimental.torch_functional.FusedLinearForPPO.forward`.
+        shift_labels: The label of every position, i.e. the token id at the next position. If given, it is
+            used instead of ``labels`` or ``input_ids`` shifted by one position.
+    """
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)
@@ -536,6 +550,20 @@ def forward_with_triton_backend(
     shift_labels: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple | Qwen2VLCausalLMOutputForPPO:
+    """Return the log-probability of the label and the entropy of the next-token distribution at every position.
+
+    Both are computed by ``linear_cross_entropy`` from the hidden states of the last layer and the ``lm_head`` weight.
+
+    The arguments not listed below are those of the ``forward`` method of the Hugging Face model.
+
+    Args:
+        temperature: Positive scalar that divides the logits.
+        banned_token_mask: Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every token id whose
+            logit is set to ``-inf`` before the softmax, or ``None`` if there is no such id. Passed to
+            :func:`verl.utils.kernel.linear_cross_entropy.linear_cross_entropy`.
+        shift_labels: The label of every position, i.e. the token id at the next position. If given, it is
+            used instead of ``labels`` or ``input_ids`` shifted by one position.
+    """
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
     outputs = qwen2_vl_forward(self, input_ids, **kwargs)

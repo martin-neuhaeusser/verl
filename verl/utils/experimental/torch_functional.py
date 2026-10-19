@@ -33,17 +33,32 @@ except ImportError:
     _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE = False
 
 
-def _softmax_without_banned(
-    logits: torch.FloatTensor, banned_token_mask: torch.BoolTensor
+def _apply_banned_token_mask(
+    logits: torch.FloatTensor, banned_token_mask: Optional[torch.BoolTensor]
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-    """Return the log-normalizer and the probabilities of the softmax over the ids not in ``banned_token_mask``.
+    """Return the logits with ``-inf`` at the banned ids, and the logits with ``0`` at the banned ids.
 
-    ``logits`` stay finite; a banned id has probability exactly 0, so products with the finite logits are 0.
+    Args:
+        logits: Logits ``z`` of shape ``(num_tokens, vocab_size)``. Modified in place if
+            ``banned_token_mask`` is not ``None``.
+        banned_token_mask: Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every banned
+            id, or ``None`` if no id is banned.
+
+    Returns:
+        A tuple ``(masked_logits, finite_logits)`` of two tensors of the shape of ``logits``:
+        ``masked_logits`` equals ``z`` with ``z_v = -inf`` for every banned id ``v``, and
+        ``finite_logits`` equals ``z`` with ``z_v = 0`` for every banned id ``v``. Both are ``logits``
+        itself if ``banned_token_mask`` is ``None``.
+
+        ``softmax(masked_logits)`` is 0 at every banned id. ``finite_logits`` replaces
+        ``masked_logits`` in every product with ``softmax(masked_logits)``: such a product is then 0
+        at the banned ids, whereas ``0 * (-inf)`` is NaN.
     """
-    masked_logits = logits.masked_fill(banned_token_mask, float("-inf"))
-    log_normalizer = torch.logsumexp(masked_logits, dim=-1)
-    probs = masked_logits.sub_(log_normalizer.unsqueeze(-1)).exp_()
-    return log_normalizer, probs
+    if banned_token_mask is None:
+        return logits, logits
+    finite_logits = logits.masked_fill(banned_token_mask, 0.0)
+    masked_logits = logits.masked_fill_(banned_token_mask, float("-inf"))
+    return masked_logits, finite_logits
 
 
 def _fused_linear_for_ppo_fwd(
@@ -53,21 +68,34 @@ def _fused_linear_for_ppo_fwd(
     temperature: float = 1.0,
     banned_token_mask: Optional[torch.BoolTensor] = None,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """Return the log-probabilities of ``input_ids`` and the entropy of the distribution ``p`` over token ids.
+
+    ``p = softmax(z)``, where ``z = hidden_states @ vocab_weights.T / temperature``, and ``z_v = -inf``
+    for every banned id ``v``.
+
+    Args:
+        hidden_states: Hidden states of shape ``(num_tokens, hidden_size)``.
+        vocab_weights: Weight matrix of the ``lm_head``, of shape ``(vocab_size, hidden_size)``.
+        input_ids: The token id ``y_i`` whose log-probability is returned, per token ``i``; shape ``(num_tokens,)``.
+        temperature: Positive scalar that divides the logits.
+        banned_token_mask: Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every banned
+            id, or ``None`` if no id is banned.
+
+    Returns:
+        A tuple ``(token_log_probs, entropy)`` of two tensors of shape ``(num_tokens,)``:
+        ``token_log_probs[i] = log p_i(y_i)``, which is ``-inf`` if ``y_i`` is banned, and
+        ``entropy[i] = -sum_v p_i(v) log p_i(v)``, where a summand with ``p_i(v) = 0`` is 0.
+    """
     logits = (hidden_states @ vocab_weights.t()) / temperature
     orig_dtype = logits.dtype
-    logits = logits.to(torch.float32)
+    logits, finite_logits = _apply_banned_token_mask(logits.to(torch.float32), banned_token_mask)
 
-    if banned_token_mask is not None:
-        log_normalizer, probs = _softmax_without_banned(logits, banned_token_mask)
-        entropy = log_normalizer - torch.sum(probs * logits, dim=-1)
-        token_log_probs = logits.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1) - log_normalizer
-        token_log_probs = token_log_probs.masked_fill(banned_token_mask[input_ids], float("-inf"))
-        return token_log_probs, entropy.to(orig_dtype)
-
+    # log p(v) = z_v - logsumexp(z), hence H(p) = logsumexp(z) - sum_v p(v) z_v.
     probs = logits.softmax(dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * finite_logits, dim=-1)
 
     if _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE:
+        # The flash-attn cross-entropy returns +inf for a label whose logit is -inf.
         per_token_entropy_loss = cross_entropy_loss(logits, input_ids)[0]
         token_log_probs = -per_token_entropy_loss
     else:
@@ -88,34 +116,43 @@ def _fused_linear_for_ppo_bwd(
     temperature: float = 1.0,
     banned_token_mask: Optional[torch.BoolTensor] = None,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """Return the gradients of the outputs of :func:`_fused_linear_for_ppo_fwd` w.r.t. its first two arguments.
+
+    Args:
+        dlog_probs: Gradient w.r.t. ``token_log_probs``, of shape ``(num_tokens,)``, or ``None`` if it is 0.
+        dentropy: Gradient w.r.t. ``entropy``, of shape ``(num_tokens,)``, or ``None`` if it is 0.
+        hidden_states, vocab_weights, input_ids, temperature, banned_token_mask: The arguments of
+            :func:`_fused_linear_for_ppo_fwd`.
+
+    Returns:
+        A tuple ``(dhidden_states, dvocab_weights)`` of the shapes of ``hidden_states`` and ``vocab_weights``.
+        The rows of ``dvocab_weights`` at the banned ids are 0, since ``z_v = -inf`` does not depend
+        on ``vocab_weights`` for a banned id ``v``.
+    """
     logits = (hidden_states @ vocab_weights.t()) / temperature
     orig_dtype = logits.dtype
-    logits = logits.to(torch.float32)
+    logits, finite_logits = _apply_banned_token_mask(logits.to(torch.float32), banned_token_mask)
 
-    if banned_token_mask is None:
-        probs = logits.softmax(dim=-1)
-    else:
-        log_normalizer, probs = _softmax_without_banned(logits, banned_token_mask)
+    probs = logits.softmax(dim=-1)
 
     dlogits = 0
 
     # Gradient from log_probs
     if dlog_probs is not None:
+        # d log p(y) / d z_v = [v = y] - p(v). For a banned label y, z_y = -inf is a constant, so the
+        # term [v = y] is omitted.
         one_hot_input = torch.zeros_like(logits).scatter_(-1, input_ids.unsqueeze(-1), 1)
         if banned_token_mask is not None:
-            # A banned label's logit is the constant -inf: only the normalizer depends on the logits.
             one_hot_input.masked_fill_(banned_token_mask, 0.0)
         dlogits += dlog_probs.to(torch.float32).unsqueeze(-1) * (one_hot_input - probs)
 
     # Gradient from entropy
     if dentropy is not None:
-        if banned_token_mask is None:
-            log_probs = logits.log_softmax(dim=-1)
-            entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
-        else:
-            # Finite at banned ids, where probs is 0, so the product below is 0 there.
-            log_probs = logits - log_normalizer.unsqueeze(-1)
-            entropy = log_normalizer - torch.sum(probs * logits, dim=-1)
+        # d H(p) / d z_v = -p(v) (log p(v) + H(p)). log p(v) = z_v - logsumexp(z) is computed from
+        # finite_logits, so that it is finite at a banned id v, where p(v) = 0 makes the product 0.
+        logsumexp_logits = torch.logsumexp(logits, dim=-1, keepdim=True)
+        log_probs = finite_logits - logsumexp_logits
+        entropy = logsumexp_logits.squeeze(-1) - torch.sum(probs * finite_logits, dim=-1)
         dlogits += probs * (log_probs + entropy.unsqueeze(-1)) * (-dentropy.unsqueeze(-1))
 
     dlogits = dlogits.to(orig_dtype) / temperature
@@ -273,10 +310,32 @@ class FusedLinearForPPO(torch.nn.Module):
         temperature: float = 1.0,
         banned_token_mask: Optional[torch.BoolTensor] = None,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        """Return per-token log-probabilities and entropy of ``softmax(hidden_states @ vocab_weights.T / temperature)``.
+        """Return the log-probabilities of ``input_ids`` and the entropy of the distribution ``p`` over token ids.
 
-        ``banned_token_mask`` (bool, shape ``(vocab_size,)``) excludes ids from the softmax: they get
-        probability 0, a banned label gets log-probability ``-inf``, and their logits get no gradient.
+        For token position ``i``, the logit vector is ``z_i = W h_i / temperature``, where ``h_i`` is the
+        hidden-state vector of position ``i`` and ``W`` is ``vocab_weights``; ``z_i[v]`` is the logit of
+        token id ``v``. If ``banned_token_mask`` is given, ``z_i[v] = -inf`` for every banned id ``v``.
+        Then ``p_i = softmax(z_i)``, so ``p_i(v) = 0`` for every banned id ``v``.
+
+        Args:
+            hidden_states: Hidden states ``h`` of shape ``(num_tokens, hidden_size)`` or
+                ``(batch_size, seq_len, hidden_size)``.
+            vocab_weights: Weight matrix ``W`` of the ``lm_head``, of shape ``(vocab_size, hidden_size)``.
+            input_ids: The token id ``y_i`` whose log-probability is returned, per position ``i``;
+                shape ``hidden_states.shape[:-1]``.
+            temperature: Positive scalar that divides the logits.
+            banned_token_mask: Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every
+                banned id, or ``None`` if no id is banned. The ``liger`` backend does not support it.
+
+        Returns:
+            A tuple ``(log_probs, entropy)`` of two tensors of shape ``input_ids.shape``:
+            ``log_probs[i] = log p_i(y_i)``, which is ``-inf`` if ``y_i`` is banned, and
+            ``entropy[i] = -sum_v p_i(v) log p_i(v)``, where a summand with ``p_i(v) = 0`` is 0. Both
+            have zero gradient w.r.t. the rows of ``vocab_weights`` at the banned ids.
+
+        Raises:
+            ValueError: If ``banned_token_mask`` does not have shape ``(vocab_size,)``.
+            NotImplementedError: If ``banned_token_mask`` is given and the backend is ``liger``.
         """
         input_ids = input_ids.to(torch.int64)
         if banned_token_mask is not None and banned_token_mask.shape != (vocab_weights.shape[0],):

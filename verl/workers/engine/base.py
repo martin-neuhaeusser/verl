@@ -302,11 +302,15 @@ class BaseEngine:
         return nullcontext()
 
     def set_rollout_vocab_mask(self, vocab_mask: Optional[RolloutVocabMask]) -> None:
-        """Exclude the token ids the rollout never samples from the policy this engine evaluates.
+        """Set the logits of the token ids in ``vocab_mask`` to ``-inf`` before computing log-probabilities and entropy.
 
-        Engines that support it set the logits of the excluded ids to ``-inf`` before they compute
-        log-probabilities and entropy. This engine does not, so it keeps evaluating the policy over
-        the full vocabulary.
+        This default implementation ignores ``vocab_mask`` and logs a warning if it is not ``None``:
+        the engine computes log-probabilities and entropy of the softmax over all logits. Engines that
+        apply the mask override this method (see ``FSDPEngineWithLMHead.set_rollout_vocab_mask``).
+
+        Args:
+            vocab_mask: The token ids that the rollout backend excludes from sampling, or ``None`` if it
+                excludes none.
         """
         if vocab_mask is not None:
             logger.warning(

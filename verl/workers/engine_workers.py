@@ -576,7 +576,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
         liger_capacity = _plan_liger_flsce_capacity(self.config, self.role)
-        # The actor and the reference model evaluate the policy the rollout samples from.
+        # The token ids that the rollout backend excludes from sampling. The actor and the reference engine
+        # set their logits to -inf, so that their log-probabilities refer to the sampling distribution.
         rollout_vocab_mask = get_rollout_vocab_mask(
             self.config.rollout.name, model_config.tokenizer, model_config.processor
         )

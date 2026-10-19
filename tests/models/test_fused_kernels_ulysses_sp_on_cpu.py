@@ -169,15 +169,15 @@ def _patch_fused_kernels():
         entropy = torch.zeros(shape, dtype=torch.float32)
         return log_probs, entropy
 
-    def fake_fused_linear_forward(
-        self, hidden_states, vocab_weights, input_ids, temperature=1.0, banned_token_mask=None
-    ):
+    # `banned_token_mask` has no default value in the two fakes below: every adapter passes it as a keyword
+    # argument, and an adapter that does not pass it makes the fake raise a TypeError.
+    def fake_fused_linear_forward(self, hidden_states, vocab_weights, input_ids, temperature, banned_token_mask):
         captured["input_ids"] = input_ids.detach().clone()
         captured["impl_backend"] = self.impl_backend
         captured["banned_token_mask"] = banned_token_mask
         return _fake_log_probs_and_entropy(input_ids)
 
-    def fake_linear_ce(hidden_states, vocab_weights, input_ids, temperature, reduction, banned_token_mask=None):
+    def fake_linear_ce(hidden_states, vocab_weights, input_ids, temperature, reduction, *, banned_token_mask):
         captured["input_ids"] = input_ids.detach().clone()
         captured["banned_token_mask"] = banned_token_mask
         return _fake_log_probs_and_entropy(input_ids)
@@ -251,9 +251,20 @@ def test_torch_adapter_propagates_fused_linear_backend(forward_fn):
 
 @pytest.mark.parametrize("forward_fn", ALL_ADAPTERS, ids=_adapter_id)
 def test_adapter_forwards_banned_token_mask(forward_fn):
-    """Every fused adapter must hand the rollout's banned-token mask to the kernel."""
+    """The adapter passes its argument `banned_token_mask` to the fused kernel.
+
+    The assertion checks object identity: the kernel receives the tensor object that the caller passed to
+    the adapter, not a copy, a slice, or `None`. The test patches both kernels, `FusedLinearForPPO.forward`
+    (torch backend) and `linear_cross_entropy` (Triton backend), so it runs on CPU.
+
+    Args:
+        forward_fn: One of the fused forward adapters in `ALL_ADAPTERS`.
+    """
     model = _make_fake_lm()
     input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
+    # A Boolean tensor of shape (vocab_size,), as the engine passes it. The kernel is replaced by a fake that
+    # records its arguments, so the values of the mask do not affect the result; banning one id makes the
+    # tensor distinguishable from an all-False mask.
     banned_token_mask = torch.zeros(model.lm_head.weight.shape[0], dtype=torch.bool)
     banned_token_mask[3] = True
 

@@ -157,8 +157,10 @@ class LinearCrossEntropy(torch.autograd.Function):
             temperature (typing.Optional[float], optional): _description_. Defaults to 1.0.
             reduction (typing.Optional[str], optional): _description_. Defaults to "none".
             dist_process_group (typing.Optional[dist.ProcessGroup], optional): _description_. Defaults to None.
-            banned_token_mask (typing.Optional[torch.Tensor], optional): bool, one entry per vocabulary id;
-                ids marked ``True`` are excluded from the softmax. Defaults to None.
+            banned_token_mask (typing.Optional[torch.Tensor], optional): Boolean tensor of shape
+                ``(world_size * vocab_size,)`` over the full vocabulary of ``dist_process_group``, ``True`` at
+                every banned token id. The logit of a banned id is set to ``-inf`` before the softmax.
+                Defaults to None: no id is banned.
 
         Returns:
             typing.List[torch.Tensor]: _description_
@@ -239,9 +241,15 @@ def linear_cross_entropy(
     Hybrid backward: CANN CE when ``dentropy==0``; chunked PyTorch CE+entropy
     (Triton-aligned) when ``dentropy!=0``.
 
-    ``banned_token_mask`` (bool, one entry per vocabulary id) excludes ids from the softmax: they get
-    probability 0, a banned label gets log-probability ``-inf``, and their logits get no gradient.
-    Only the Triton backend on CUDA supports it.
+    Args:
+        banned_token_mask: Boolean tensor with one entry per token id of the full (unsharded) vocabulary,
+            ``True`` at every banned id, or ``None`` if no id is banned. The logit ``z_v`` of every banned
+            id ``v`` is set to ``-inf`` before the softmax. Hence ``p(v) = 0``, the log-probability of a
+            banned label is ``-inf``, and the rows of ``weight`` at banned ids receive zero gradient.
+            Only ``impl_backend="triton"`` on CUDA supports it, and only with ``reduction="none"``.
+
+    Raises:
+        NotImplementedError: If ``banned_token_mask`` is given with a backend other than Triton on CUDA.
     """
     if not isinstance(impl_backend, str):
         raise TypeError(f"impl_backend must be a string, got {type(impl_backend)}")

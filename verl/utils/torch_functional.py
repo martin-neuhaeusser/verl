@@ -229,10 +229,18 @@ def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.T
 
 
 def _expected_logit(probs: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-    """Return sum(probs * logits) over the last dimension, where a ``-inf`` logit contributes 0.
+    """Return the expected value ``sum_v p(v) z_v`` of the logits ``z`` under the distribution ``p``.
 
-    A ``-inf`` logit has probability 0, and 0 * (-inf) is NaN. Replacing the logit by 0 before the
-    product, not the product after it, also keeps the gradient finite.
+    A summand with ``z_v = -inf`` is defined as 0: there ``p(v) = 0``, and the product ``0 * (-inf)``
+    would be NaN. The function replaces ``z_v`` by 0 before the multiplication rather than replacing
+    the NaN product afterwards, because the gradient of the product is NaN in the latter case.
+
+    Args:
+        probs: The probabilities ``p = softmax(logits)``, of shape ``(..., vocab_size)``.
+        logits: The logits ``z``, of shape ``(..., vocab_size)``.
+
+    Returns:
+        A tensor of shape ``(...,)``.
     """
     finite_logits = logits.masked_fill(logits == float("-inf"), 0.0)
     return torch.sum(probs * finite_logits, dim=-1)
@@ -244,7 +252,7 @@ def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     Computes H(p) = -sum(p * log(p)) using the numerically stable formula:
     entropy = logsumexp(logits) - sum(softmax(logits) * logits)
 
-    A ``-inf`` logit marks a token outside the support of p; it contributes 0 (0 * log 0 = 0).
+    A token with logit ``-inf`` has ``p = 0``; its summand ``p * log(p)`` is defined as 0.
 
     Args:
         logits: Unnormalized log-probabilities of shape (..., vocab_size).
@@ -272,7 +280,7 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
 
     Note:
         Converts chunks to float32 for numerical stability during computation.
-        A ``-inf`` logit contributes 0, as in :func:`entropy_from_logits`.
+        A token with logit ``-inf`` contributes 0 to the entropy, as in :func:`entropy_from_logits`.
     """
     entropy = torch.zeros(logits.shape[0], device=logits.device)
     for i in range(0, logits.shape[0], chunk_size):

@@ -510,8 +510,9 @@ class vLLMHttpServer:
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
         # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
-        # sequence assumes it does. Mask them out with the OOV tail, so the policy cannot pick one.
-        # The actor and the reference model apply the same mask (see get_rollout_vocab_mask).
+        # sequence assumes it does. vLLM sets the logits of these ids, and of every id >= len(tokenizer),
+        # to -inf before sampling. The actor and the reference model use the same set of ids
+        # (see get_rollout_vocab_mask).
         vocab_mask = get_rollout_vocab_mask("vllm", self.model_config.tokenizer, self.model_config.processor)
         await engine_client.collective_rpc(
             method="monkey_patch_model",
