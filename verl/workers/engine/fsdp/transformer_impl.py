@@ -70,6 +70,7 @@ from verl.utils.ulysses import (
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
+from verl.utils.vocab_mask import RolloutVocabMask
 from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelConfig
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
@@ -1152,6 +1153,75 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    # Boolean tensor of shape (vocab_size,) that is True at every token id excluded by set_rollout_vocab_mask,
+    # or None if no id is excluded. A class attribute, so that it also exists in subclasses whose __init__
+    # does not call FSDPEngine.__init__ (VeOmniEngineWithLMHead).
+    _banned_token_mask: Optional[torch.Tensor] = None
+
+    def set_rollout_vocab_mask(self, vocab_mask: Optional[RolloutVocabMask]) -> None:
+        """Set the logits of the token ids in ``vocab_mask`` to ``-inf`` in every subsequent forward pass.
+
+        Let ``z`` be the logit vector of a token position after the division by the temperature. This
+        engine replaces ``z_v`` by ``-inf`` for every id ``v`` in ``vocab_mask``, on the eager path and
+        on the fused-kernel path, and computes log-probabilities and entropy of ``softmax(z)``. Hence
+        every id in ``vocab_mask`` has probability 0, and the rows of the ``lm_head`` weight at these
+        ids receive zero gradient.
+
+        With the mask that the rollout backend applies before sampling, the log-probabilities this
+        engine computes are those of the distribution that generated the samples.
+
+        Args:
+            vocab_mask: The token ids to exclude, or ``None`` to compute the softmax over all logits.
+
+        Raises:
+            ValueError: If ``vocab_mask`` contains an id that is not smaller than the ``vocab_size`` of
+                the model's text config.
+        """
+        if vocab_mask is None:
+            self._banned_token_mask = None
+        else:
+            self._banned_token_mask = vocab_mask.banned_mask(self.model_config.hf_config.get_text_config().vocab_size)
+
+    def _get_banned_token_mask(self, device: torch.device) -> Optional[torch.Tensor]:
+        """Return the mask set by :meth:`set_rollout_vocab_mask`, on ``device``.
+
+        Args:
+            device: The device of the logits that the mask is applied to.
+
+        Returns:
+            A Boolean tensor of shape ``(vocab_size,)`` that is ``True`` at every excluded token id, or
+            ``None`` if no id is excluded. A mask on another device is moved to ``device`` and kept there for
+            subsequent calls.
+        """
+        if self._banned_token_mask is not None and self._banned_token_mask.device != device:
+            self._banned_token_mask = self._banned_token_mask.to(device)
+        return self._banned_token_mask
+
+    def _mask_banned_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Set the logits of the excluded token ids to ``-inf``.
+
+        Args:
+            logits: Logits of shape ``(..., vocab_size)``. Modified in place.
+
+        Returns:
+            ``logits``, with ``logits[..., v] = -inf`` for every token id ``v`` excluded by
+            :meth:`set_rollout_vocab_mask`.
+
+        Raises:
+            ValueError: If the last dimension of ``logits`` differs from the size of the mask.
+        """
+        banned_token_mask = self._get_banned_token_mask(logits.device)
+        if banned_token_mask is None:
+            return logits
+        if logits.shape[-1] != banned_token_mask.shape[0]:
+            raise ValueError(
+                f"The model produces {logits.shape[-1]} logits per position, but the rollout vocabulary mask "
+                f"has {banned_token_mask.shape[0]} entries (the vocab_size of the model's text config)"
+            )
+        # In place, to avoid allocating a second tensor of the size of the logits. Autograd permits this
+        # because none of the operations that computed `logits` saved `logits` for its backward pass.
+        return logits.masked_fill_(banned_token_mask, float("-inf"))
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
         score_centering = tu.get_non_tensor_data(data=micro_batch, key="score_centering", default=False)
@@ -1327,6 +1397,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if use_fused_kernels:
             extra_args["temperature"] = temperature_item
             extra_args["return_dict"] = True
+            banned_token_mask = self._get_banned_token_mask(input_ids.device)
+            if banned_token_mask is not None:
+                extra_args["banned_token_mask"] = banned_token_mask
             if use_remove_padding:
                 # We have already computed `input_ids_rmpad_rolled` from the *full*
                 # global sequence and (when SP>1) SP-sliced it. Pass it into the model
@@ -1406,6 +1479,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     temperature_rmpad.unsqueeze(-1),
                     is_unit_temperature=temperature_is_one,
                 )
+                logits_rmpad = self._mask_banned_logits(logits_rmpad)
 
                 log_probs = None
 
@@ -1502,6 +1576,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     temperature,
                     is_unit_temperature=temperature_is_one,
                 )
+                logits = self._mask_banned_logits(logits)
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:

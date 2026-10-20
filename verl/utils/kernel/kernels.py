@@ -180,6 +180,20 @@ def set_backward_method(backward_method: BackwardEnum):
     _config._backward = backward_method
 
 
+@triton.jit
+def _banned_columns(banned_ptr, offs_n, vocab_size):
+    """Return a Boolean vector that is ``True`` at every position ``j`` with ``offs_n[j]`` a banned token id.
+
+    Args:
+        banned_ptr: Pointer to a ``uint8`` vector of length ``vocab_size``, nonzero at every banned
+            token id of this rank's vocabulary shard.
+        offs_n: Vector of token ids (local to this rank's shard), i.e. column indices of the logits.
+        vocab_size: The number of token ids in this rank's shard. Ids ``>= vocab_size`` are reported as
+            not banned; the callers exclude them from the softmax separately.
+    """
+    return tl.load(banned_ptr + offs_n, mask=offs_n < vocab_size, other=0) != 0
+
+
 # The inner strides are deliberately left unannotated so that Triton specializes them to 1 and can prove
 # contiguity (an annotated int argument is never specialized). The outer strides keep `tl.int64` for 64-bit
 # address arithmetic.
@@ -214,11 +228,13 @@ def efficient_entropy_kernel_general_mainloop(
     stride_global_logprobs,
     global_logprobs_scalar_ptr,
     rcp_temperature: tl.float32,
+    banned_ptr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     USE_TMA: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     """
     forward mainloop
@@ -313,14 +329,31 @@ def efficient_entropy_kernel_general_mainloop(
         logits *= rcp_temperature
 
         logits_for_lse = tl.where(offs_bn[None, :] < vocab_bound, logits, float("-inf"))
+        if HAS_VOCAB_MASK:
+            # Replace the logit of every banned column by -inf. Then exp(logit) = 0 there, so banned columns
+            # do not affect _max and contribute 0 to _accu and _entropy_b.
+            banned = _banned_columns(banned_ptr, offs_bn, vocab_size)
+            logits_for_lse = tl.where(banned[None, :], float("-inf"), logits_for_lse)
 
         # update global maximum
         _max_old = _max
         m_pid_n = tl.max(logits_for_lse, axis=1)
         _max = tl.maximum(_max_old, m_pid_n)
+        # This loop computes the softmax statistics online: _max is the maximum logit of a row over the
+        # columns processed so far, and the sums _accu and _entropy_b are scaled by exp(-_max). When _max
+        # increases, the factor coeff = exp(_max_old - _max) rescales the sums to the new maximum.
+        # _max starts at -inf. Without a mask, the first block of columns of every split contains a finite
+        # logit, so _max is finite after the first block. With a mask, all columns processed so far can be
+        # banned; then _max = _max_old = -inf, and both exp(logits_for_lse - _max) and coeff evaluate
+        # -inf - (-inf), which is NaN. Subtracting 0 instead of _max in that case yields exp(-inf) = 0 for
+        # both, so that _accu and _entropy_b remain 0 until the first column that is not banned.
+        if HAS_VOCAB_MASK:
+            _max_shift = tl.where(_max == float("-inf"), 0.0, _max)
+        else:
+            _max_shift = _max
 
-        exp_logits = tl.exp(logits_for_lse - _max[:, None])
-        coeff = tl.exp(_max_old - _max)
+        exp_logits = tl.exp(logits_for_lse - _max_shift[:, None])
+        coeff = tl.exp(_max_old - _max_shift)
         _accu = coeff * _accu + tl.sum(exp_logits, axis=1)
 
         _entropy_b = _entropy_b * coeff + tl.sum(logits * exp_logits, axis=1)
@@ -566,6 +599,42 @@ def efficient_entropy_triton_epilogue_tp_update(
 _dedicated_stream, _dedicated_events = None, None
 
 
+def _local_banned_columns(
+    banned_token_mask: typing.Optional[torch.Tensor],
+    vocab_size: int,
+    rank: int,
+    world_size: int,
+    placeholder: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    """Return the part of ``banned_token_mask`` that belongs to the vocabulary shard of ``rank``, as ``uint8``.
+
+    Args:
+        banned_token_mask: Boolean tensor of shape ``(world_size * vocab_size,)``, ``True`` at every banned
+            token id of the full vocabulary, or ``None`` if no id is banned.
+        vocab_size: The number of token ids in the vocabulary shard of each rank.
+        rank: The rank of this process in the tensor-parallel group; it holds the token ids
+            ``rank * vocab_size, ..., (rank + 1) * vocab_size - 1``.
+        world_size: The number of ranks in the tensor-parallel group.
+        placeholder: A tensor on the device of the kernels. It is returned in place of the mask if
+            ``banned_token_mask`` is ``None``, because a Triton kernel needs a pointer argument even when
+            ``HAS_VOCAB_MASK`` is ``False`` and the kernel does not read it.
+
+    Returns:
+        A tuple ``(banned_columns, has_vocab_mask)``. If ``banned_token_mask`` is not ``None``,
+        ``banned_columns`` is a contiguous ``uint8`` tensor of shape ``(vocab_size,)`` that is nonzero at every
+        banned id of the shard, and ``has_vocab_mask`` is ``True``. Otherwise ``banned_columns`` is
+        ``placeholder``, and ``has_vocab_mask`` is ``False``.
+    """
+    if banned_token_mask is None:
+        return placeholder, False
+    assert banned_token_mask.dtype == torch.bool and banned_token_mask.device == placeholder.device
+    assert banned_token_mask.shape == (vocab_size * world_size,), (
+        f"banned_token_mask has shape {tuple(banned_token_mask.shape)}, expected ({vocab_size * world_size},)"
+    )
+    local = banned_token_mask[rank * vocab_size : (rank + 1) * vocab_size].contiguous().view(torch.uint8)
+    return local, True
+
+
 def efficient_entropy_forward(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -573,9 +642,16 @@ def efficient_entropy_forward(
     reduction: typing.Optional[int] = 2,
     temperature: typing.Optional[float] = 1.0,
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
+    banned_token_mask: typing.Optional[torch.Tensor] = None,
 ) -> list[torch.Tensor]:
     """
     forward host function
+
+    Args:
+        banned_token_mask: Boolean tensor of shape ``(world_size * vocab_size,)``, ``True`` at every banned
+            token id of the full vocabulary, or ``None`` if no id is banned. The logit of every banned id is
+            set to ``-inf`` before the softmax. Hence a banned id has probability 0, and a banned label has
+            log-probability ``-inf``. Requires ``reduction="none"``.
     """
     assert hidden.is_cuda and weight.is_cuda and labels.is_cuda
     assert weight.device == hidden.device and labels.device == hidden.device
@@ -599,6 +675,10 @@ def efficient_entropy_forward(
     assert hidden_size % 128 == 0
 
     REDUCTION = get_entropy_reduction_enum(reduction)
+
+    banned_columns, has_vocab_mask = _local_banned_columns(banned_token_mask, vocab_size, _rank, _world_size, labels)
+    if has_vocab_mask and REDUCTION != EntropyReductionEnum._None:
+        raise NotImplementedError("banned_token_mask requires reduction='none'")
 
     if REDUCTION == EntropyReductionEnum._None:
         if dist_process_group is None:
@@ -667,7 +747,9 @@ def efficient_entropy_forward(
             _logprobs.stride(0),
             logprobs,
             1.0 / temperature,
+            banned_columns,
             USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
+            HAS_VOCAB_MASK=has_vocab_mask,
         )
     else:
         raise AssertionError("Triton is required for efficient entropy kernel")
@@ -756,6 +838,11 @@ def efficient_entropy_forward(
             REDUCTION,
         )
 
+    if has_vocab_mask:
+        # The kernel computes log p(label) from the finite logit of the label, not from the masked logit.
+        # The masked logit of a banned label is -inf, so its log-probability is -inf.
+        logprobs.masked_fill_(banned_token_mask[labels], float("-inf"))
+
     return (logprobs, entropy, maximum, accumulate, entropy_b)
 
 
@@ -802,11 +889,13 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     stride_d_weight_n: tl.int64,
     stride_d_weight_k,
     rcp_temperature: tl.float32,
+    banned_ptr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     """
     backward mainloop, where d_logits & d_hidden & d_weight are fused
@@ -913,6 +1002,12 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
+    if HAS_VOCAB_MASK:
+        # A banned id v has p(v) = 0, so exp_logits is set to 0 there. A banned label has the constant
+        # logit -inf, so its term of d log p(label) / d logit is omitted from `mask`.
+        banned = _banned_columns(banned_ptr, offs_bn, vocab_size)
+        exp_logits = tl.where(banned[None, :], 0.0, exp_logits)
+        mask = mask & (banned[None, :] == 0)
     d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
     d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
@@ -1008,10 +1103,12 @@ def efficient_entropy_backward_kernel_d_hidden(
     stride_d_hidden_m: tl.int64,
     stride_d_hidden_k,
     rcp_temperature: tl.float32,
+    banned_ptr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     """
     backward d_hidden
@@ -1075,6 +1172,12 @@ def efficient_entropy_backward_kernel_d_hidden(
         exp_logits = tl.exp(logits - maximum[:, None])
 
         mask = (offs_n + rank * vocab_size)[None, :] == labels[:, None]
+        if HAS_VOCAB_MASK:
+            # A banned id v has p(v) = 0, so exp_logits is set to 0 there. A banned label has the constant
+            # logit -inf, so its term of d log p(label) / d logit is omitted from `mask`.
+            banned = _banned_columns(banned_ptr, offs_n, vocab_size)
+            exp_logits = tl.where(banned[None, :], 0.0, exp_logits)
+            mask = mask & (banned[None, :] == 0)
         d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
         d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
@@ -1135,10 +1238,12 @@ def efficient_entropy_backward_kernel_d_weight(
     stride_d_weight_n: tl.int64,
     stride_d_weight_k,
     rcp_temperature: tl.float32,
+    banned_ptr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_n = tl.cdiv(vocab_size, BLOCK_SIZE_N)
@@ -1196,6 +1301,12 @@ def efficient_entropy_backward_kernel_d_weight(
         exp_logits = tl.exp(logits - maximum[:, None])
 
         mask = (offs_n + rank * vocab_size)[None, :] == labels[:, None]
+        if HAS_VOCAB_MASK:
+            # A banned id v has p(v) = 0, so exp_logits is set to 0 there. A banned label has the constant
+            # logit -inf, so its term of d log p(label) / d logit is omitted from `mask`.
+            banned = _banned_columns(banned_ptr, offs_n, vocab_size)
+            exp_logits = tl.where(banned[None, :], 0.0, exp_logits)
+            mask = mask & (banned[None, :] == 0)
         d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
         d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
@@ -1255,11 +1366,13 @@ def efficient_entropy_backward_kernel_general_d_logits(
     stride_d_logits_m: tl.int64,
     stride_d_logits_n,
     rcp_temperature: tl.float32,
+    banned_ptr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     """
     backward d_logits
@@ -1362,6 +1475,12 @@ def efficient_entropy_backward_kernel_general_d_logits(
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
+    if HAS_VOCAB_MASK:
+        # A banned id v has p(v) = 0, so exp_logits is set to 0 there. A banned label has the constant
+        # logit -inf, so its term of d log p(label) / d logit is omitted from `mask`.
+        banned = _banned_columns(banned_ptr, offs_bn, vocab_size)
+        exp_logits = tl.where(banned[None, :], 0.0, exp_logits)
+        mask = mask & (banned[None, :] == 0)
     d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
     d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
@@ -1418,11 +1537,13 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     stride_d_logits_m: tl.int64,
     stride_d_logits_n,
     rcp_temperature: tl.float32,
+    banned_ptr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_TMA: tl.constexpr,
+    HAS_VOCAB_MASK: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(num_tokens, BLOCK_SIZE_M)
@@ -1501,6 +1622,12 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     exp_logits = tl.exp(logits - maximum[:, None])
 
     mask = (offs_bn + rank * vocab_size)[None, :] == labels[:, None]
+    if HAS_VOCAB_MASK:
+        # A banned id v has p(v) = 0, so exp_logits is set to 0 there. A banned label has the constant
+        # logit -inf, so its term of d log p(label) / d logit is omitted from `mask`.
+        banned = _banned_columns(banned_ptr, offs_bn, vocab_size)
+        exp_logits = tl.where(banned[None, :], 0.0, exp_logits)
+        mask = mask & (banned[None, :] == 0)
     d_logits = d_logprobs[:, None] * (exp_logits * accu_rcp[:, None] - mask)
     d_logits += d_entropy[:, None] * (-exp_logits * accu_rcp[:, None]) * (logits - entropy_b[:, None])
 
@@ -1528,9 +1655,15 @@ def efficient_entropy_backward(
     should_return_fp32_grad: bool = False,
     temperature: typing.Optional[float] = 1.0,
     dist_process_group: typing.Optional[dist.ProcessGroup] = None,
+    banned_token_mask: typing.Optional[torch.Tensor] = None,
 ) -> list[torch.Tensor]:
     """
     backward host function
+
+    Args:
+        banned_token_mask: The ``banned_token_mask`` that was passed to :func:`efficient_entropy_forward`.
+            The gradients w.r.t. the logits of the banned ids are 0, hence the rows of ``d_weight`` at the
+            banned ids are 0.
     """
     assert hidden.is_cuda and weight.is_cuda and labels.is_cuda
     assert weight.device == hidden.device and labels.device == hidden.device
@@ -1547,6 +1680,8 @@ def efficient_entropy_backward(
     assert hidden_size % 128 == 0
 
     REDUCTION = get_entropy_reduction_enum(reduction)
+
+    banned_columns, has_vocab_mask = _local_banned_columns(banned_token_mask, vocab_size, _rank, _world_size, labels)
 
     if REDUCTION == EntropyReductionEnum._None:
         assert dlogprobs.shape == (num_tokens,)
@@ -1615,7 +1750,9 @@ def efficient_entropy_backward(
             d_weight.stride(0),
             d_weight.stride(1),
             1.0 / temperature,
+            banned_columns,
             USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
+            HAS_VOCAB_MASK=has_vocab_mask,
         )
 
     elif _config._backward == BackwardEnum._Total_Separate:
@@ -1655,7 +1792,9 @@ def efficient_entropy_backward(
                 _d_logits.stride(0),
                 _d_logits.stride(1),
                 1.0 / temperature,
+                banned_columns,
                 USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
+                HAS_VOCAB_MASK=has_vocab_mask,
             )
 
             torch.matmul(_d_logits, weight, out=d_hidden)
@@ -1704,7 +1843,9 @@ def efficient_entropy_backward(
                 _d_logits.stride(0),
                 _d_logits.stride(1),
                 1.0 / temperature,
+                banned_columns,
                 USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
+                HAS_VOCAB_MASK=has_vocab_mask,
             )
 
             if split_idx == (num_splits - 1):
