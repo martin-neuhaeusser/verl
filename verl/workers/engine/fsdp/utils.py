@@ -14,6 +14,8 @@
 import logging
 import os
 
+import torch
+from packaging import version
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.utils.device import get_device_name, is_npu_available
@@ -121,3 +123,39 @@ def unfuse_moe_params(weights, model_type: str | None = None):
             continue
 
         yield name, tensor
+
+
+def lora_params_to_cast(module: torch.nn.Module, strategy: str) -> tuple[torch.dtype | None, list[torch.nn.Parameter]]:
+    """Return the trainable parameters to cast to the dtype of the frozen parameters before the FSDP wrap.
+
+    ``get_peft_model`` stores the LoRA parameters in fp32 (``autocast_adapter_dtype=True``, the default), while
+    the frozen base parameters have the dtype the model was loaded in, e.g. bf16. An optimizer step on a bf16
+    parameter rounds every update smaller than half the spacing of bf16 values at the parameter's magnitude to
+    zero; on an fp32 parameter it does not. Keeping the LoRA parameters in fp32 therefore preserves small updates.
+
+    FSDP requires one dtype per wrap unit, for a set of parameters that depends on the FSDP version:
+    - FSDP1 (``strategy="fsdp"``) stores each wrap unit in one ``FlatParameter`` of a single dtype, i.e. all of its
+      parameters, trainable or frozen, must share one dtype.
+    - FSDP2 (``strategy="fsdp2"``) checks only the trainable parameters of a wrap unit for a single dtype, from
+      torch 2.8 on (``FSDPParamGroup._init_mp_dtypes``); up to torch 2.7 it checks all parameters.
+
+    Hence the trainable parameters keep their dtype if and only if the strategy is ``fsdp2``, torch is 2.8 or
+    later, and all trainable parameters share one dtype. Otherwise every trainable parameter whose dtype differs
+    from that of the frozen parameters is returned for casting.
+
+    Args:
+        module: The model returned by ``get_peft_model``, before the FSDP wrap.
+        strategy: ``engine_config.strategy``, i.e. ``"fsdp"`` or ``"fsdp2"``.
+
+    Returns:
+        A tuple ``(base_dtype, params)``: ``base_dtype`` is the dtype of the first frozen parameter, or ``None`` if
+        no parameter is frozen; ``params`` are the trainable parameters to cast to ``base_dtype``, empty if none.
+    """
+    base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
+    if base_dtype is None:
+        return None, []
+    trainable = [p for p in module.parameters() if p.requires_grad]
+    fsdp2_checks_only_trainable = version.parse(torch.__version__).release >= (2, 8)
+    if strategy == "fsdp2" and fsdp2_checks_only_trainable and len({p.dtype for p in trainable}) == 1:
+        return base_dtype, []
+    return base_dtype, [p for p in trainable if p.dtype != base_dtype]

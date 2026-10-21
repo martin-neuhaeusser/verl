@@ -81,7 +81,7 @@ from ..utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
+from .utils import create_device_mesh, get_sharding_strategy, lora_params_to_cast, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -371,18 +371,14 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-            # FSDP requires all params in a flat group to share dtype: cast a
-            # fp32 adapter to the bf16 base dtype only when they actually differ.
-            base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-            if base_dtype is not None:
-                mismatched = [p for p in module.parameters() if p.requires_grad and p.dtype != base_dtype]
-                if mismatched:
-                    logger.info(
-                        f"Casting {len(mismatched)} LoRA adapter params from "
-                        f"{mismatched[0].dtype} to {base_dtype} to match base."
-                    )
-                    for param in mismatched:
-                        param.data = param.data.to(base_dtype)
+            base_dtype, mismatched = lora_params_to_cast(module, self.engine_config.strategy)
+            if mismatched:
+                logger.info(
+                    f"Casting {len(mismatched)} LoRA adapter params from {mismatched[0].dtype} to {base_dtype} "
+                    f"to match base."
+                )
+                for param in mismatched:
+                    param.data = param.data.to(base_dtype)
 
         return module
 
