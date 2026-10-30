@@ -376,10 +376,19 @@ class FSDPEngine(BaseEngine):
         return module
 
     def _cast_lora_params(self, wrap_units: list[torch.nn.Module]) -> None:
-        """Cast the parameters of each tuple ``(dtype, params)`` of ``lora_params_to_cast`` in place to ``dtype``.
+        """Cast trainable parameters in place to the dtype of the frozen parameters of their FSDP wrap unit.
+
+        A trainable parameter is cast if and only if its wrap unit violates the dtype requirement of FSDP for
+        ``self.engine_config.strategy`` and its dtype differs from that of the frozen parameters of its wrap unit.
 
         Args:
-            wrap_units: The modules of which FSDP makes wrap units, as in ``lora_params_to_cast``.
+            wrap_units: The FSDP wrap units, given by distinct modules of which one, the root, has all others as
+                descendants. The wrap unit of a module ``m`` holds the parameters of ``m`` and of every descendant of
+                ``m`` whose path from ``m`` contains no other module of ``wrap_units``.
+
+        Raises:
+            ValueError: If a wrap unit that violates the dtype requirement has no frozen parameter or frozen
+                parameters of more than one dtype.
         """
         casts = lora_params_to_cast(wrap_units, self.engine_config.strategy)
         for dtype, params in casts:
@@ -425,18 +434,6 @@ class FSDPEngine(BaseEngine):
             is_lora=self.model_config.lora_rank > 0,
         )
 
-        if self._is_lora:
-            # Each helper takes what the respective wrap call below takes: the FSDP1 constructor derives the wrap units
-            # from ``auto_wrap_policy``, ``apply_fsdp2`` selects them from the engine config.
-            match self.engine_config.strategy:
-                case "fsdp":
-                    wrap_modules = get_fsdp1_wrap_modules(module, auto_wrap_policy)
-                case "fsdp2":
-                    wrap_modules = get_fsdp2_wrap_modules(module, self.engine_config)
-                case _:
-                    raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
-            self._cast_lora_params([module, *wrap_modules])
-
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)
 
@@ -455,6 +452,9 @@ class FSDPEngine(BaseEngine):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
 
+            if self._is_lora:
+                # Cast the LoRA parameters of each FSDP1 wrap unit that would hold parameters of several dtypes.
+                self._cast_lora_params([module, *get_fsdp1_wrap_modules(module, auto_wrap_policy)])
             module = FSDP(
                 module,
                 param_init_fn=init_fn,
@@ -489,6 +489,9 @@ class FSDPEngine(BaseEngine):
                 "offload_policy": offload_policy,
                 "reshard_after_forward": self.engine_config.reshard_after_forward,
             }
+            if self._is_lora:
+                # Cast the LoRA parameters of each FSDP2 wrap unit that violates the dtype requirement of FSDP2.
+                self._cast_lora_params([module, *get_fsdp2_wrap_modules(module, self.engine_config)])
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)

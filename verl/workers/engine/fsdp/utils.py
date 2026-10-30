@@ -147,12 +147,11 @@ def lora_params_to_cast(
     This function determines which trainable LoRA parameters need to be cast.
 
     Args:
-        wrap_units: The modules of which FSDP makes wrap units: the model returned by ``get_peft_model``, before the
-            FSDP wrap, and any of its submodules. The wrap unit of a module ``m`` holds the parameters of ``m`` and of
-            those descendants of ``m`` that are neither in ``wrap_units`` nor descendants of a module in ``wrap_units``
-            below ``m``.
-        strategy: ``engine_config.strategy``, i.e. ``"fsdp"``, ``"fsdp2"``, or ``"fsdp_turbo"``. For ``"fsdp_turbo"``,
-            all parameters of a wrap unit must share one dtype, as for ``"fsdp"``.
+        wrap_units: The FSDP wrap units, given by distinct modules of which one, the root, has all others as
+            descendants. The wrap unit of a module ``m`` holds the parameters of ``m`` and of every descendant of ``m``
+            whose path from ``m`` contains no other module of ``wrap_units``.
+        strategy: ``"fsdp"``, ``"fsdp2"``, or ``"fsdp_turbo"``; ``"fsdp_turbo"`` has the dtype requirement of
+            ``"fsdp"``.
 
     Returns:
         One tuple ``(dtype, params)`` per wrap unit whose dtypes violate the requirement of ``strategy``: ``dtype`` is
