@@ -50,6 +50,10 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
+        if self._is_lora:
+            # verl does not know the wrap units of FSDPTurbo; with the root as the only wrap unit, every trainable
+            # parameter whose dtype differs from that of the frozen parameters is cast.
+            self._cast_lora_params(module, [])
         full_state = module.state_dict()
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
         offload_policy = None

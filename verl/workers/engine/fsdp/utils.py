@@ -127,7 +127,7 @@ def unfuse_moe_params(weights, model_type: str | None = None):
 
 def lora_params_to_cast(
     module: torch.nn.Module, strategy: str, wrap_modules: list[torch.nn.Module]
-) -> tuple[torch.dtype | None, list[torch.nn.Parameter]]:
+) -> list[tuple[torch.dtype, list[torch.nn.Parameter]]]:
     """Return the minimal set of LoRA parameters that need to be cast to the dtype of the frozen parameters
     for FSDP to correctly wrap the model while trying to preserve the precision of the trainable LoRA parameters.
 
@@ -148,27 +148,45 @@ def lora_params_to_cast(
 
     Args:
         module: The model returned by ``get_peft_model``, before the FSDP wrap.
-        strategy: ``engine_config.strategy``, i.e. ``"fsdp"`` or ``"fsdp2"``.
+        strategy: ``engine_config.strategy``, i.e. ``"fsdp"``, ``"fsdp2"``, or ``"fsdp_turbo"``. For ``"fsdp_turbo"``,
+            whose dtype requirement verl does not know, all parameters of a wrap unit must share one dtype.
         wrap_modules: The submodules of ``module`` that FSDP wraps into their own wrap units, e.g. from
             ``get_fsdp1_wrap_modules`` or ``get_fsdp2_wrap_modules``; ``module`` itself is always a wrap unit.
 
     Returns:
-        A tuple ``(base_dtype, params)``: ``base_dtype`` is the dtype of the first frozen parameter, or ``None`` if
-        no parameter is frozen; ``params`` are the trainable parameters to cast to ``base_dtype``, empty if none.
+        One tuple ``(dtype, params)`` per wrap unit whose dtypes violate the requirement of ``strategy``: ``dtype`` is
+        the dtype of the frozen parameters of the wrap unit, and ``params`` are the trainable parameters of the wrap
+        unit to cast to ``dtype``. The list is empty if no wrap unit violates the requirement.
+
+    Raises:
+        ValueError: If ``strategy`` is none of the above, or if a wrap unit whose dtypes violate the requirement has
+            no frozen parameter or frozen parameters of more than one dtype.
     """
-    base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-    all_params_share_dtype = strategy == "fsdp" or version.parse(torch.__version__).release < (2, 8)
+    match strategy:
+        case "fsdp" | "fsdp_turbo":
+            all_params_share_dtype = True
+        case "fsdp2":
+            all_params_share_dtype = version.parse(torch.__version__).release < (2, 8)
+        case _:
+            raise ValueError(f"Unknown strategy {strategy}")
     # A wrap unit holds the parameters of its module that no nested wrap unit holds. In pre-order, a module precedes
     # its submodules, so the reverse pre-order visits each wrap unit before the wrap units enclosing it.
     pre_order = {m: i for i, m in enumerate(module.modules())}
     wrap_units = sorted({*wrap_modules, module}, key=pre_order.__getitem__, reverse=True)
     assigned = set()
-    to_cast = []
+    casts = []
     for unit in wrap_units:
         params = [p for p in unit.parameters() if p not in assigned]
         assigned.update(params)
         trainable = [p for p in params if p.requires_grad]
         constrained = params if all_params_share_dtype else trainable
-        if base_dtype is not None and len({p.dtype for p in constrained}) > 1:
-            to_cast.extend(p for p in trainable if p.dtype != base_dtype)
-    return base_dtype, to_cast
+        if len({p.dtype for p in constrained}) > 1:
+            frozen_dtypes = {p.dtype for p in params if not p.requires_grad}
+            if len(frozen_dtypes) != 1:
+                raise ValueError(
+                    f"The wrap unit {type(unit).__name__} needs its trainable parameters cast to the dtype of its "
+                    f"frozen parameters, but these have the dtypes {frozen_dtypes}"
+                )
+            (dtype,) = frozen_dtypes
+            casts.append((dtype, [p for p in trainable if p.dtype != dtype]))
+    return casts

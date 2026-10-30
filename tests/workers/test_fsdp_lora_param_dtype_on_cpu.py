@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tests of the decision which LoRA parameters ``FSDPEngine._build_fsdp_module`` casts before the FSDP wrap.
 
-``lora_params_to_cast`` casts a trainable parameter to the frozen dtype only if its wrap unit would otherwise violate
+``lora_params_to_cast`` casts a trainable parameter to the frozen dtype of its wrap unit only if the unit would violate
 the dtype requirement of FSDP: one dtype for all parameters of a wrap unit (FSDP1, and FSDP2 before torch 2.8), or
 one dtype for the trainable parameters of a wrap unit (FSDP2 from torch 2.8 on). The wrap units come from
 ``get_fsdp1_wrap_modules`` and ``get_fsdp2_wrap_modules``; the former is checked against torch's own traversal.
@@ -75,21 +75,24 @@ def test_fsdp2_keeps_fp32_lora_params(monkeypatch, torch_version):
         torch_version: The torch version, including a local version label as in the CUDA wheels.
     """
     monkeypatch.setattr(torch, "__version__", torch_version)
-    base_dtype, params = lora_params_to_cast(_peft_model(), "fsdp2", [])
 
-    assert base_dtype == torch.bfloat16
-    assert params == []
+    assert lora_params_to_cast(_peft_model(), "fsdp2", []) == []
 
 
-def test_fsdp1_with_one_wrap_unit_casts_lora_params():
-    """Under FSDP1 with the root as the only wrap unit, every LoRA parameter is cast.
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp_turbo"])
+def test_one_wrap_unit_with_all_params_sharing_one_dtype_casts_lora_params(strategy):
+    """Under FSDP1, and FSDPTurbo, with the root as the only wrap unit, every LoRA parameter is cast to bf16.
 
-    The root ``FlatParameter`` would hold the frozen bf16 and the trainable fp32 parameters, but holds one dtype.
+    The root wrap unit holds the frozen bf16 and the trainable fp32 parameters, but all of its parameters must share
+    one dtype: FSDP1 holds them in one ``FlatParameter``, and for FSDPTurbo this requirement is assumed.
+
+    Args:
+        strategy: The engine strategy.
     """
     module = _peft_model()
-    base_dtype, params = lora_params_to_cast(module, "fsdp", [])
+    [(dtype, params)] = lora_params_to_cast(module, strategy, [])
 
-    assert base_dtype == torch.bfloat16
+    assert dtype == torch.bfloat16
     assert _ids(params) == _ids(_lora_params(module))
 
 
@@ -105,7 +108,7 @@ def test_fsdp1_with_lora_wrap_policy_keeps_fp32_lora_params():
     wrap_modules = get_fsdp1_wrap_modules(module, get_fsdp_wrap_policy(module, is_lora=True))
 
     assert _ids(p for m in wrap_modules for p in m.parameters()) == _ids(_lora_params(module))
-    assert lora_params_to_cast(module, "fsdp", wrap_modules) == (torch.bfloat16, [])
+    assert lora_params_to_cast(module, "fsdp", wrap_modules) == []
 
 
 def test_fsdp2_before_torch_2_8_casts_lora_params(monkeypatch):
@@ -116,8 +119,9 @@ def test_fsdp2_before_torch_2_8_casts_lora_params(monkeypatch):
     """
     monkeypatch.setattr(torch, "__version__", "2.7.1")
     module = _peft_model()
-    _, params = lora_params_to_cast(module, "fsdp2", [])
+    [(dtype, params)] = lora_params_to_cast(module, "fsdp2", [])
 
+    assert dtype == torch.bfloat16
     assert _ids(params) == _ids(_lora_params(module))
 
 
@@ -133,13 +137,12 @@ def test_fsdp2_with_trainable_params_of_two_dtypes_in_one_unit_casts_the_fp32_on
     """
     monkeypatch.setattr(torch, "__version__", "2.13.0")
     module = _peft_model()
-    out_weight = module.base_model.model.out.weight
-    out_weight.requires_grad_(True)
+    module.base_model.model.out.weight.requires_grad_(True)
 
-    _, params = lora_params_to_cast(module, "fsdp2", [])
+    [(dtype, params)] = lora_params_to_cast(module, "fsdp2", [])
 
+    assert dtype == torch.bfloat16
     assert _ids(params) == _ids(_lora_params(module))
-    assert all(p is not out_weight for p in params)
 
 
 def test_fsdp2_with_trainable_params_of_two_dtypes_in_two_units_keeps_fp32_lora_params(monkeypatch):
@@ -157,16 +160,57 @@ def test_fsdp2_with_trainable_params_of_two_dtypes_in_two_units_keeps_fp32_lora_
     out = module.base_model.model.out
     out.weight.requires_grad_(True)
 
-    assert lora_params_to_cast(module, "fsdp2", [out]) == (torch.bfloat16, [])
+    assert lora_params_to_cast(module, "fsdp2", [out]) == []
 
 
-def test_without_frozen_params_nothing_is_cast():
-    """Without a frozen parameter there is no base dtype to cast to: the result is ``(None, [])``."""
+def test_fsdp1_casts_to_the_frozen_dtype_of_each_wrap_unit():
+    """Under FSDP1, the LoRA parameters of each wrap unit are cast to the dtype of that unit's frozen parameters.
+
+    Test vector: LoRA adapters on ``q_proj`` and ``out``, whose frozen base weights are bf16 and fp16, and each of the
+    two LoRA layers is a wrap unit. The expected result has one tuple per wrap unit, with the frozen dtype and the two
+    LoRA parameters of that unit; a single dtype for the model would cast one of the two units to the wrong dtype.
+    """
+    module = get_peft_model(_TinyModel(), LoraConfig(r=2, lora_alpha=2, target_modules=["q_proj", "out"]))
+    q_proj, out = module.base_model.model.q_proj, module.base_model.model.out
+    out.base_layer.to(torch.float16)
+
+    casts = lora_params_to_cast(module, "fsdp", [q_proj, out])
+
+    assert {(dtype, frozenset(_ids(params))) for dtype, params in casts} == {
+        (torch.bfloat16, frozenset(_ids(_lora_params(q_proj)))),
+        (torch.float16, frozenset(_ids(_lora_params(out)))),
+    }
+
+
+def test_wrap_unit_without_frozen_params_raises():
+    """A wrap unit that needs a cast but has no frozen parameter has no dtype to cast to, so ``ValueError`` is raised.
+
+    Test vector: all parameters are trainable, so the root wrap unit holds bf16 and fp32 trainable parameters only.
+    """
     module = _peft_model()
     for param in module.parameters():
         param.requires_grad_(True)
 
-    assert lora_params_to_cast(module, "fsdp", []) == (None, [])
+    with pytest.raises(ValueError, match="dtypes set\\(\\)"):
+        lora_params_to_cast(module, "fsdp", [])
+
+
+def test_wrap_unit_with_frozen_params_of_two_dtypes_raises():
+    """A wrap unit that needs a cast but has frozen parameters of two dtypes has no unique dtype to cast to.
+
+    Test vector: the frozen weight of ``out`` is fp16 and that of ``q_proj`` bf16, both in the root wrap unit.
+    """
+    module = _peft_model()
+    module.base_model.model.out.to(torch.float16)
+
+    with pytest.raises(ValueError, match="frozen parameters"):
+        lora_params_to_cast(module, "fsdp", [])
+
+
+def test_unknown_strategy_raises():
+    """A strategy other than ``"fsdp"``, ``"fsdp2"``, and ``"fsdp_turbo"`` raises ``ValueError``."""
+    with pytest.raises(ValueError, match="Unknown strategy megatron"):
+        lora_params_to_cast(_peft_model(), "megatron", [])
 
 
 class _NestedModel(torch.nn.Module):
