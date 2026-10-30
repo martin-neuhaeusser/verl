@@ -21,7 +21,7 @@ import os
 from abc import ABC
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from typing import Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -36,6 +36,7 @@ from transformers.trainer_pt_utils import get_module_class_from_name
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.model import check_exclude_modules, check_target_modules
+from verl.workers.config import FSDPEngineConfig
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,36 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         auto_wrap_policy = functools.partial(_or_policy, policies=policies)
 
     return auto_wrap_policy
+
+
+def get_fsdp1_wrap_modules(module: nn.Module, wrap_policy: Callable[..., bool] | None) -> list[nn.Module]:
+    """Return the submodules of ``module`` that FSDP1 shards as wrap units of their own under ``wrap_policy``.
+
+    Args:
+        module: The module to shard.
+        wrap_policy: An FSDP1 auto wrap policy in the form of a callable; ``None`` makes no submodule a wrap unit.
+
+    Returns:
+        The submodules in post-order: each submodule follows those of its descendants that are returned.
+    """
+    wrap_modules = []
+
+    def wrap(submodule: nn.Module) -> int:
+        """Return the number of parameter elements of ``submodule`` in returned modules, appending these modules."""
+        numel = sum(p.numel() for p in submodule.parameters())
+        wrapped_numel = 0
+        if wrap_policy(module=submodule, recurse=True, nonwrapped_numel=numel):
+            wrapped_numel = sum(wrap(child) for child in submodule.children())
+            if submodule is not module and wrap_policy(
+                module=submodule, recurse=False, nonwrapped_numel=numel - wrapped_numel
+            ):
+                wrap_modules.append(submodule)
+                wrapped_numel = numel
+        return wrapped_numel
+
+    if wrap_policy is not None:
+        wrap(module)
+    return wrap_modules
 
 
 @torch.no_grad()
@@ -561,10 +592,23 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
-def apply_fsdp2(model, fsdp_kwargs, config):
-    """model: AutoModelForCausalLM"""
-    assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+def get_fsdp2_wrap_modules(model: nn.Module, config: FSDPEngineConfig) -> list[nn.Module]:
+    """Return the submodules of ``model`` that FSDP2 shards as wrap units of their own.
 
+    These are the submodules whose class name is in ``config.wrap_policy["transformer_layer_cls_to_wrap"]``, or in
+    ``model._no_split_modules`` if that key is absent, and, if ``model.config.tie_word_embeddings`` is false, the
+    ``nn.Embedding`` submodules and the submodules named ``embed_tokens`` or ``lm_head``.
+
+    Args:
+        model: A ``transformers.PreTrainedModel``.
+        config: The FSDP engine config.
+
+    Returns:
+        The submodules in the order of ``model.named_modules()``.
+
+    Raises:
+        AssertionError: If no class name is given.
+    """
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
     fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
@@ -577,7 +621,30 @@ def apply_fsdp2(model, fsdp_kwargs, config):
         fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
-    modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+    return _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+
+
+def apply_fsdp2(model: nn.Module, fsdp_kwargs: dict[str, Any], config: FSDPEngineConfig) -> None:
+    """Shard ``model`` in place with FSDP2.
+
+    The wrap units are ``model`` and its submodules whose class name is in
+    ``config.wrap_policy["transformer_layer_cls_to_wrap"]``, or in ``model._no_split_modules`` if that key is absent,
+    and, if ``model.config.tie_word_embeddings`` is false, its ``nn.Embedding`` submodules and its submodules named
+    ``embed_tokens`` or ``lm_head``. If ``config.forward_prefetch`` is true and torch is 2.5 or later, each of these
+    submodules prefetches, in the forward pass, the parameters of the next one in the order of
+    ``model.named_modules()``.
+
+    Args:
+        model: A ``transformers.PreTrainedModel``.
+        fsdp_kwargs: The keyword arguments of ``fully_shard`` for every wrap unit.
+        config: The FSDP engine config.
+
+    Raises:
+        AssertionError: If torch is earlier than 2.4, or if no class name is given.
+    """
+    assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+
+    modules = get_fsdp2_wrap_modules(model, config)
 
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

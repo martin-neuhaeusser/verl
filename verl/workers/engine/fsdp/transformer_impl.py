@@ -48,6 +48,8 @@ from verl.utils.fsdp_utils import (
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp1_wrap_modules,
+    get_fsdp2_wrap_modules,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -81,7 +83,7 @@ from ..utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
-from .utils import create_device_mesh, get_sharding_strategy, unfuse_moe_params
+from .utils import create_device_mesh, get_sharding_strategy, lora_params_to_cast, unfuse_moe_params
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -371,20 +373,32 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-            # FSDP requires all params in a flat group to share dtype: cast a
-            # fp32 adapter to the bf16 base dtype only when they actually differ.
-            base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-            if base_dtype is not None:
-                mismatched = [p for p in module.parameters() if p.requires_grad and p.dtype != base_dtype]
-                if mismatched:
-                    logger.info(
-                        f"Casting {len(mismatched)} LoRA adapter params from "
-                        f"{mismatched[0].dtype} to {base_dtype} to match base."
-                    )
-                    for param in mismatched:
-                        param.data = param.data.to(base_dtype)
-
         return module
+
+    def _cast_lora_params(self, wrap_units: list[torch.nn.Module]) -> None:
+        """Cast trainable parameters in place to the dtype of the frozen parameters of their FSDP wrap unit.
+
+        A trainable parameter is cast if and only if its wrap unit violates the dtype requirement of FSDP for
+        ``self.engine_config.strategy`` and its dtype differs from that of the frozen parameters of its wrap unit.
+
+        Args:
+            wrap_units: The FSDP wrap units, given by distinct modules of which one, the root, has all others as
+                descendants. The wrap unit of a module ``m`` holds the parameters of ``m`` and of every descendant of
+                ``m`` whose path from ``m`` contains no other module of ``wrap_units``.
+
+        Raises:
+            ValueError: If a wrap unit that violates the dtype requirement has no frozen parameter or frozen
+                parameters of more than one dtype.
+        """
+        casts = lora_params_to_cast(wrap_units, self.engine_config.strategy)
+        for dtype, params in casts:
+            for param in params:
+                param.data = param.data.to(dtype)
+        if casts:
+            logger.info(
+                f"Cast {sum(len(params) for _, params in casts)} LoRA adapter params in {len(casts)} wrap units to "
+                f"the dtype of the frozen params of their wrap unit."
+            )
 
     def _build_fsdp_module(self, module):
         # TODO(ziheng): need to improve
@@ -438,6 +452,9 @@ class FSDPEngine(BaseEngine):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
 
+            if self._is_lora:
+                # Cast the LoRA parameters of each FSDP1 wrap unit that would hold parameters of several dtypes.
+                self._cast_lora_params([module, *get_fsdp1_wrap_modules(module, auto_wrap_policy)])
             module = FSDP(
                 module,
                 param_init_fn=init_fn,
@@ -472,6 +489,9 @@ class FSDPEngine(BaseEngine):
                 "offload_policy": offload_policy,
                 "reshard_after_forward": self.engine_config.reshard_after_forward,
             }
+            if self._is_lora:
+                # Cast the LoRA parameters of each FSDP2 wrap unit that violates the dtype requirement of FSDP2.
+                self._cast_lora_params([module, *get_fsdp2_wrap_modules(module, self.engine_config)])
             full_state = module.state_dict()
             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
