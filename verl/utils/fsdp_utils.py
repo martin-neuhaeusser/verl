@@ -627,9 +627,12 @@ def get_fsdp2_wrap_modules(model: nn.Module, config: FSDPEngineConfig) -> list[n
 def apply_fsdp2(model: nn.Module, fsdp_kwargs: dict[str, Any], config: FSDPEngineConfig) -> None:
     """Shard ``model`` in place with FSDP2.
 
-    The wrap units are ``model`` and the submodules ``get_fsdp2_wrap_modules(model, config)``. If
-    ``config.forward_prefetch`` is true and torch is 2.5 or later, each of these submodules prefetches the parameters
-    of the next one in the forward pass.
+    The wrap units are ``model`` and its submodules whose class name is in
+    ``config.wrap_policy["transformer_layer_cls_to_wrap"]``, or in ``model._no_split_modules`` if that key is absent,
+    and, if ``model.config.tie_word_embeddings`` is false, its ``nn.Embedding`` submodules and its submodules named
+    ``embed_tokens`` or ``lm_head``. If ``config.forward_prefetch`` is true and torch is 2.5 or later, each of these
+    submodules prefetches, in the forward pass, the parameters of the next one in the order of
+    ``model.named_modules()``.
 
     Args:
         model: A ``transformers.PreTrainedModel``.
@@ -637,7 +640,7 @@ def apply_fsdp2(model: nn.Module, fsdp_kwargs: dict[str, Any], config: FSDPEngin
         config: The FSDP engine config.
 
     Raises:
-        AssertionError: If torch is earlier than 2.4, or if ``get_fsdp2_wrap_modules`` raises it.
+        AssertionError: If torch is earlier than 2.4, or if no class name is given.
     """
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
 

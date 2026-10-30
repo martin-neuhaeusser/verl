@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests of the decision which LoRA parameters ``FSDPEngine._build_fsdp_module`` casts before the FSDP wrap.
+"""Tests of ``lora_params_to_cast`` and ``get_fsdp1_wrap_modules``.
 
-``lora_params_to_cast`` casts a trainable parameter to the frozen dtype of its wrap unit only if the unit would violate
-the dtype requirement of FSDP: one dtype for all parameters of a wrap unit (FSDP1, and FSDP2 before torch 2.8), or
-one dtype for the trainable parameters of a wrap unit (FSDP2 from torch 2.8 on). The wrap units come from
-``get_fsdp1_wrap_modules`` and ``get_fsdp2_wrap_modules``; the former is checked against torch's own traversal.
+``lora_params_to_cast`` returns the trainable parameters of a wrap unit whose dtype differs from that of its frozen
+parameters, together with the latter dtype, if and only if the wrap unit violates the dtype requirement of FSDP: one
+dtype for all parameters of a wrap unit (FSDP1, and FSDP2 before torch 2.8), or one dtype for the trainable parameters
+of a wrap unit (FSDP2 from torch 2.8 on). ``get_fsdp1_wrap_modules`` is compared with the traversal of
+``torch.distributed.fsdp.wrap``.
 """
 
 import functools
