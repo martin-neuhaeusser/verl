@@ -20,8 +20,9 @@ import math
 import os
 from abc import ABC
 from collections import OrderedDict
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
-from typing import Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -165,33 +166,40 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     return auto_wrap_policy
 
 
-def get_fsdp1_wrap_modules(module: nn.Module, auto_wrap_policy) -> list[nn.Module]:
-    """Return the submodules of ``module`` that FSDP1 wraps into their own wrap units under ``auto_wrap_policy``.
+def get_fsdp1_wrap_modules(module: nn.Module, wrap_policy: Callable[..., bool] | None) -> list[nn.Module]:
+    """Return the submodules of ``module`` of which FSDP1 makes wrap units under ``wrap_policy``.
 
-    The wrap unit of ``module`` itself, which FSDP1 always creates, is not included. The traversal reproduces
-    ``torch.distributed.fsdp.wrap._recursive_wrap``, which FSDP1 runs for a callable ``auto_wrap_policy``.
+    The traversal is that of ``torch.distributed.fsdp.wrap._recursive_wrap`` and starts at ``module``. For a visited
+    module ``m`` with ``n`` parameter elements, ``wrap_policy(module=m, recurse=True, nonwrapped_numel=n)`` decides
+    whether the children of ``m`` are visited. If they are, and ``m`` is not ``module``, then
+    ``wrap_policy(module=m, recurse=False, nonwrapped_numel=r)`` decides whether ``m`` is returned, where ``r`` is the
+    number of parameter elements of ``m`` outside the returned descendants of ``m``.
 
     Args:
-        module: The module passed to the FSDP1 constructor.
-        auto_wrap_policy: The ``auto_wrap_policy`` passed to the FSDP1 constructor, e.g. from
-            ``get_fsdp_wrap_policy``; ``None`` for no submodule wrap units.
+        module: The root module of the traversal; it is not returned.
+        wrap_policy: The FSDP1 auto wrap policy: a callable with the keyword arguments ``module`` (``nn.Module``),
+            ``recurse`` (``bool``), and ``nonwrapped_numel`` (``int``) that returns a ``bool``. ``None`` returns no
+            submodule.
+
+    Returns:
+        The returned submodules in post-order, i.e. each after its returned descendants.
     """
     wrap_modules = []
 
     def wrap(submodule: nn.Module) -> int:
-        """Collect the wrap units in the subtree of ``submodule``, return the number of their parameter elements."""
+        """Return the number of parameter elements of ``submodule`` in returned modules, appending these modules."""
         numel = sum(p.numel() for p in submodule.parameters())
         wrapped_numel = 0
-        if auto_wrap_policy(module=submodule, recurse=True, nonwrapped_numel=numel):
+        if wrap_policy(module=submodule, recurse=True, nonwrapped_numel=numel):
             wrapped_numel = sum(wrap(child) for child in submodule.children())
-            if submodule is not module and auto_wrap_policy(
+            if submodule is not module and wrap_policy(
                 module=submodule, recurse=False, nonwrapped_numel=numel - wrapped_numel
             ):
                 wrap_modules.append(submodule)
                 wrapped_numel = numel
         return wrapped_numel
 
-    if auto_wrap_policy is not None:
+    if wrap_policy is not None:
         wrap(module)
     return wrap_modules
 
@@ -592,13 +600,24 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
-def get_fsdp2_wrap_modules(model, config) -> list[nn.Module]:
-    """Return the submodules of ``model`` that ``apply_fsdp2`` wraps with ``fully_shard`` before wrapping ``model``.
+def get_fsdp2_wrap_modules(model: nn.Module, config: Mapping[str, Any]) -> list[nn.Module]:
+    """Return the transformer layers and, for untied word embeddings, the embedding and output layers of ``model``.
+
+    The transformer layers are the submodules whose class name is in ``config["wrap_policy"]
+    ["transformer_layer_cls_to_wrap"]`` if that key is set, and in ``model._no_split_modules`` otherwise. Unless
+    ``model.config.tie_word_embeddings`` is true, the submodules of type ``nn.Embedding`` and those named
+    ``embed_tokens`` or ``lm_head`` that have a ``weight`` are returned as well.
 
     Args:
-        model: The model to wrap.
-        config: The engine config; its ``wrap_policy.transformer_layer_cls_to_wrap`` overrides
-            ``model._no_split_modules`` as the class names of the transformer layers to wrap.
+        model: A Hugging Face model, i.e. with the attributes ``config`` and ``_no_split_modules``.
+        config: A mapping whose optional key ``"wrap_policy"`` maps to a mapping with the optional key
+            ``"transformer_layer_cls_to_wrap"``: a class name, or a list or set of class names.
+
+    Returns:
+        The returned submodules in the order of ``model.named_modules()``.
+
+    Raises:
+        AssertionError: If there is no transformer layer class name.
     """
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
     fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
@@ -615,8 +634,25 @@ def get_fsdp2_wrap_modules(model, config) -> list[nn.Module]:
     return _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
 
 
-def apply_fsdp2(model, fsdp_kwargs, config):
-    """model: AutoModelForCausalLM"""
+def apply_fsdp2(model: nn.Module, fsdp_kwargs: dict[str, Any], config: Mapping[str, Any]) -> None:
+    """Shard ``model`` in place with FSDP2.
+
+    ``fully_shard(m, **fsdp_kwargs)`` is called for each module ``m`` of ``get_fsdp2_wrap_modules(model, config)``,
+    in that order, and then for ``model``. If ``config["forward_prefetch"]`` is true and torch is 2.5 or later, each
+    module of ``get_fsdp2_wrap_modules(model, config)`` then prefetches the parameters of the next one in the forward
+    pass.
+
+    Args:
+        model: A Hugging Face model, as in ``get_fsdp2_wrap_modules``.
+        fsdp_kwargs: The keyword arguments of every ``fully_shard`` call, e.g. ``mesh``, ``mp_policy``,
+            ``offload_policy``, and ``reshard_after_forward``.
+        config: A mapping as in ``get_fsdp2_wrap_modules``, with the additional optional key ``"forward_prefetch"``
+            (``bool``, default ``False``).
+
+    Raises:
+        AssertionError: If torch is earlier than 2.4, which has no ``fully_shard``, or if
+            ``get_fsdp2_wrap_modules`` raises it.
+    """
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
 
     modules = get_fsdp2_wrap_modules(model, config)

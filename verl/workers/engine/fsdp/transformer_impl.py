@@ -375,14 +375,13 @@ class FSDPEngine(BaseEngine):
 
         return module
 
-    def _cast_lora_params(self, module, wrap_modules):
-        """Cast the trainable parameters of each wrap unit that ``lora_params_to_cast`` returns to their dtype.
+    def _cast_lora_params(self, wrap_units: list[torch.nn.Module]) -> None:
+        """Cast the parameters of each tuple ``(dtype, params)`` of ``lora_params_to_cast`` in place to ``dtype``.
 
         Args:
-            module: The model returned by ``get_peft_model``, before the FSDP wrap.
-            wrap_modules: The submodules of ``module`` that FSDP wraps into their own wrap units.
+            wrap_units: The modules of which FSDP makes wrap units, as in ``lora_params_to_cast``.
         """
-        casts = lora_params_to_cast(module, self.engine_config.strategy, wrap_modules)
+        casts = lora_params_to_cast(wrap_units, self.engine_config.strategy)
         for dtype, params in casts:
             for param in params:
                 param.data = param.data.to(dtype)
@@ -436,7 +435,7 @@ class FSDPEngine(BaseEngine):
                     wrap_modules = get_fsdp2_wrap_modules(module, self.engine_config)
                 case _:
                     raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
-            self._cast_lora_params(module, wrap_modules)
+            self._cast_lora_params([module, *wrap_modules])
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)

@@ -126,7 +126,7 @@ def unfuse_moe_params(weights, model_type: str | None = None):
 
 
 def lora_params_to_cast(
-    module: torch.nn.Module, strategy: str, wrap_modules: list[torch.nn.Module]
+    wrap_units: list[torch.nn.Module], strategy: str
 ) -> list[tuple[torch.dtype, list[torch.nn.Parameter]]]:
     """Return the minimal set of LoRA parameters that need to be cast to the dtype of the frozen parameters
     for FSDP to correctly wrap the model while trying to preserve the precision of the trainable LoRA parameters.
@@ -147,11 +147,12 @@ def lora_params_to_cast(
     This function determines which trainable LoRA parameters need to be cast.
 
     Args:
-        module: The model returned by ``get_peft_model``, before the FSDP wrap.
+        wrap_units: The modules of which FSDP makes wrap units: the model returned by ``get_peft_model``, before the
+            FSDP wrap, and any of its submodules. The wrap unit of a module ``m`` holds the parameters of ``m`` and of
+            those descendants of ``m`` that are neither in ``wrap_units`` nor descendants of a module in ``wrap_units``
+            below ``m``.
         strategy: ``engine_config.strategy``, i.e. ``"fsdp"``, ``"fsdp2"``, or ``"fsdp_turbo"``. For ``"fsdp_turbo"``,
-            whose dtype requirement verl does not know, all parameters of a wrap unit must share one dtype.
-        wrap_modules: The submodules of ``module`` that FSDP wraps into their own wrap units, e.g. from
-            ``get_fsdp1_wrap_modules`` or ``get_fsdp2_wrap_modules``; ``module`` itself is always a wrap unit.
+            all parameters of a wrap unit must share one dtype, as for ``"fsdp"``.
 
     Returns:
         One tuple ``(dtype, params)`` per wrap unit whose dtypes violate the requirement of ``strategy``: ``dtype`` is
@@ -164,22 +165,37 @@ def lora_params_to_cast(
     """
     match strategy:
         case "fsdp" | "fsdp_turbo":
+            # FSDP1 holds the parameters of a wrap unit in one FlatParameter, which has a single dtype. FSDPTurbo is an
+            # external package, and verl does not inspect which parameters of a wrap unit it requires to share one
+            # dtype. If all parameters of a wrap unit share one dtype, so does every subset of them, so this
+            # requirement satisfies whichever one FSDPTurbo has.
             all_params_share_dtype = True
         case "fsdp2":
+            # FSDPParamGroup._init_mp_dtypes requires one dtype for all parameters of a wrap unit up to torch 2.7, and
+            # for the trainable parameters of a wrap unit only from torch 2.8 on.
             all_params_share_dtype = version.parse(torch.__version__).release < (2, 8)
         case _:
-            raise ValueError(f"Unknown strategy {strategy}")
-    # A wrap unit holds the parameters of its module that no nested wrap unit holds. In pre-order, a module precedes
-    # its submodules, so the reverse pre-order visits each wrap unit before the wrap units enclosing it.
-    pre_order = {m: i for i, m in enumerate(module.modules())}
-    wrap_units = sorted({*wrap_modules, module}, key=pre_order.__getitem__, reverse=True)
-    assigned = set()
-    casts = []
+            raise ValueError(f'strategy must be "fsdp", "fsdp2", or "fsdp_turbo", but is "{strategy}"')
+    # The modules in ``wrap_units``, for the membership test that stops the traversal of a wrap unit at the next one.
+    wrap_unit_set: set[torch.nn.Module] = set(wrap_units)
+    # One tuple (dtype, params) per wrap unit that needs a cast, as returned.
+    casts: list[tuple[torch.dtype, list[torch.nn.Parameter]]] = []
     for unit in wrap_units:
-        params = [p for p in unit.parameters() if p not in assigned]
-        assigned.update(params)
+        # Collect the parameters of the wrap unit of ``unit`` by a depth-first traversal from ``unit`` that does not
+        # enter the modules of other wrap units. Each module, and hence each parameter, is visited once over all wrap
+        # units. dict.fromkeys removes parameters that several modules of the wrap unit share, and keeps the order.
+        modules = [unit]
+        unit_params = []
+        while modules:
+            submodule = modules.pop()
+            unit_params.extend(submodule.parameters(recurse=False))
+            modules.extend(child for child in submodule.children() if child not in wrap_unit_set)
+        params = list(dict.fromkeys(unit_params))
         trainable = [p for p in params if p.requires_grad]
         constrained = params if all_params_share_dtype else trainable
+        # The constrained parameters of a wrap unit must share one dtype. If they have several, the trainable
+        # parameters whose dtype differs from that of the frozen parameters are cast to it; afterwards, all
+        # constrained parameters have this dtype. That requires the frozen parameters to share exactly one dtype.
         if len({p.dtype for p in constrained}) > 1:
             frozen_dtypes = {p.dtype for p in params if not p.requires_grad}
             if len(frozen_dtypes) != 1:
