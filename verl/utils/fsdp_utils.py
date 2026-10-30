@@ -165,6 +165,37 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     return auto_wrap_policy
 
 
+def get_fsdp1_wrap_modules(module: nn.Module, auto_wrap_policy) -> list[nn.Module]:
+    """Return the submodules of ``module`` that FSDP1 wraps into their own wrap units under ``auto_wrap_policy``.
+
+    The wrap unit of ``module`` itself, which FSDP1 always creates, is not included. The traversal reproduces
+    ``torch.distributed.fsdp.wrap._recursive_wrap``, which FSDP1 runs for a callable ``auto_wrap_policy``.
+
+    Args:
+        module: The module passed to the FSDP1 constructor.
+        auto_wrap_policy: The ``auto_wrap_policy`` passed to the FSDP1 constructor, e.g. from
+            ``get_fsdp_wrap_policy``; ``None`` for no submodule wrap units.
+    """
+    wrap_modules = []
+
+    def wrap(submodule: nn.Module) -> int:
+        """Collect the wrap units in the subtree of ``submodule``, return the number of their parameter elements."""
+        numel = sum(p.numel() for p in submodule.parameters())
+        wrapped_numel = 0
+        if auto_wrap_policy(module=submodule, recurse=True, nonwrapped_numel=numel):
+            wrapped_numel = sum(wrap(child) for child in submodule.children())
+            if submodule is not module and auto_wrap_policy(
+                module=submodule, recurse=False, nonwrapped_numel=numel - wrapped_numel
+            ):
+                wrap_modules.append(submodule)
+                wrapped_numel = numel
+        return wrapped_numel
+
+    if auto_wrap_policy is not None:
+        wrap(module)
+    return wrap_modules
+
+
 @torch.no_grad()
 def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
     if fsdp_version(model) == 2 or fsdp_version(model) == 0:
@@ -561,10 +592,14 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
-def apply_fsdp2(model, fsdp_kwargs, config):
-    """model: AutoModelForCausalLM"""
-    assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+def get_fsdp2_wrap_modules(model, config) -> list[nn.Module]:
+    """Return the submodules of ``model`` that ``apply_fsdp2`` wraps with ``fully_shard`` before wrapping ``model``.
 
+    Args:
+        model: The model to wrap.
+        config: The engine config; its ``wrap_policy.transformer_layer_cls_to_wrap`` overrides
+            ``model._no_split_modules`` as the class names of the transformer layers to wrap.
+    """
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
     fsdp_transformer_layer_cls_to_wrap = config.get("wrap_policy", {}).get(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
@@ -577,7 +612,14 @@ def apply_fsdp2(model, fsdp_kwargs, config):
         fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
 
-    modules = _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+    return _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap)
+
+
+def apply_fsdp2(model, fsdp_kwargs, config):
+    """model: AutoModelForCausalLM"""
+    assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+
+    modules = get_fsdp2_wrap_modules(model, config)
 
     for idx, module in enumerate(modules):
         # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

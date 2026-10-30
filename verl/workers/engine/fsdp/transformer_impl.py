@@ -48,6 +48,8 @@ from verl.utils.fsdp_utils import (
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp1_wrap_modules,
+    get_fsdp2_wrap_modules,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -371,15 +373,6 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
-            base_dtype, mismatched = lora_params_to_cast(module, self.engine_config.strategy)
-            if mismatched:
-                logger.info(
-                    f"Casting {len(mismatched)} LoRA adapter params from {mismatched[0].dtype} to {base_dtype} "
-                    f"to match base."
-                )
-                for param in mismatched:
-                    param.data = param.data.to(base_dtype)
-
         return module
 
     def _build_fsdp_module(self, module):
@@ -415,6 +408,20 @@ class FSDPEngine(BaseEngine):
             config=self.engine_config.wrap_policy,
             is_lora=self.model_config.lora_rank > 0,
         )
+
+        if self._is_lora:
+            if self.engine_config.strategy == "fsdp":
+                wrap_modules = get_fsdp1_wrap_modules(module, auto_wrap_policy)
+            else:
+                wrap_modules = get_fsdp2_wrap_modules(module, self.engine_config)
+            base_dtype, mismatched = lora_params_to_cast(module, self.engine_config.strategy, wrap_modules)
+            if mismatched:
+                logger.info(
+                    f"Casting {len(mismatched)} LoRA adapter params from {mismatched[0].dtype} to {base_dtype} "
+                    f"to match base."
+                )
+                for param in mismatched:
+                    param.data = param.data.to(base_dtype)
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)

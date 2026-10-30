@@ -125,7 +125,9 @@ def unfuse_moe_params(weights, model_type: str | None = None):
         yield name, tensor
 
 
-def lora_params_to_cast(module: torch.nn.Module, strategy: str) -> tuple[torch.dtype | None, list[torch.nn.Parameter]]:
+def lora_params_to_cast(
+    module: torch.nn.Module, strategy: str, wrap_modules: list[torch.nn.Module]
+) -> tuple[torch.dtype | None, list[torch.nn.Parameter]]:
     """Return the minimal set of LoRA parameters that need to be cast to the dtype of the frozen parameters
     for FSDP to correctly wrap the model while trying to preserve the precision of the trainable LoRA parameters.
 
@@ -147,16 +149,26 @@ def lora_params_to_cast(module: torch.nn.Module, strategy: str) -> tuple[torch.d
     Args:
         module: The model returned by ``get_peft_model``, before the FSDP wrap.
         strategy: ``engine_config.strategy``, i.e. ``"fsdp"`` or ``"fsdp2"``.
+        wrap_modules: The submodules of ``module`` that FSDP wraps into their own wrap units, e.g. from
+            ``get_fsdp1_wrap_modules`` or ``get_fsdp2_wrap_modules``; ``module`` itself is always a wrap unit.
 
     Returns:
         A tuple ``(base_dtype, params)``: ``base_dtype`` is the dtype of the first frozen parameter, or ``None`` if
         no parameter is frozen; ``params`` are the trainable parameters to cast to ``base_dtype``, empty if none.
     """
     base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-    if base_dtype is None:
-        return None, []
-    trainable = [p for p in module.parameters() if p.requires_grad]
-    fsdp2_checks_only_trainable = version.parse(torch.__version__).release >= (2, 8)
-    if strategy == "fsdp2" and fsdp2_checks_only_trainable and len({p.dtype for p in trainable}) == 1:
-        return base_dtype, []
-    return base_dtype, [p for p in trainable if p.dtype != base_dtype]
+    all_params_share_dtype = strategy == "fsdp" or version.parse(torch.__version__).release < (2, 8)
+    # A wrap unit holds the parameters of its module that no nested wrap unit holds. In pre-order, a module precedes
+    # its submodules, so the reverse pre-order visits each wrap unit before the wrap units enclosing it.
+    pre_order = {m: i for i, m in enumerate(module.modules())}
+    wrap_units = sorted({*wrap_modules, module}, key=pre_order.__getitem__, reverse=True)
+    assigned = set()
+    to_cast = []
+    for unit in wrap_units:
+        params = [p for p in unit.parameters() if p not in assigned]
+        assigned.update(params)
+        trainable = [p for p in params if p.requires_grad]
+        constrained = params if all_params_share_dtype else trainable
+        if base_dtype is not None and len({p.dtype for p in constrained}) > 1:
+            to_cast.extend(p for p in trainable if p.dtype != base_dtype)
+    return base_dtype, to_cast
