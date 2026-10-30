@@ -24,7 +24,9 @@ from verl.utils.torch_functional import (
     calculate_sum_pi_squared_from_logits,
     distributed_masked_mean,
     distributed_mean_max_min_std,
+    entropy_from_logits,
     expand_as_nested,
+    logprobs_from_logits,
     masked_mean,
 )
 
@@ -148,6 +150,58 @@ def test_calculate_sum_pi_squared_from_logits_extreme_values():
     expected = torch.softmax(logits, dim=-1).pow(2).sum(dim=-1)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the flash-attn cross-entropy path runs on CUDA")
+# The flash-attn cross-entropy kernel, which `logprobs_from_logits` uses on CUDA, processes the logits of a row in
+# blocks of at most 16 * 1024 columns (`MAX_BLOCK_SIZE` in flash_attn/ops/triton/cross_entropy.py, flash-attn
+# >= 2.7) and combines the blocks with an online softmax. A row of 1000 logits fits into one block; a row of
+# 151936 logits, the size of the Qwen2 vocabulary, spans 10 blocks.
+@pytest.mark.parametrize("vocab_size", [1000, 151936])
+def test_log_probs_and_entropy_of_masked_logits(vocab_size):
+    """`logprobs_from_logits` and `entropy_from_logits` compute the masked softmax when logits are `-inf`.
+
+    The FSDP engine sets the logits of the token ids that the rollout excludes from sampling to `-inf` and then
+    calls these two functions. Let `B` be the set of ids with logit `-inf` and `p = softmax(z)`, so `p(v) = 0`
+    for `v` in `B`. The test establishes that
+    - the log-probability of a label `y` equals `log p(y)`, and is `-inf` for `y` in `B`,
+    - the entropy equals the entropy of the softmax over the logits outside `B`,
+    - the gradient w.r.t. the logits is finite, and 0 at the ids in `B`.
+
+    Args:
+        vocab_size: The number of logits per row: one flash-attn block or several (see above).
+    """
+    # Test vector: 64 rows of random logits. B consists of the ids 3 and 17 and of the last 200 ids, as the
+    # placeholder ids and the ids beyond the tokenizer in the rollout mask. The labels are drawn from the ids
+    # before the last 200, so most labels are not in B; the label of row 0 is set to the banned id 3.
+    torch.manual_seed(0)
+    num_tokens = 64
+    banned = torch.zeros(vocab_size, dtype=torch.bool, device="cuda")
+    banned[[3, 17]] = True
+    banned[-200:] = True
+    base = torch.randn(num_tokens, vocab_size, device="cuda", requires_grad=True)
+    labels = torch.randint(0, vocab_size - 200, (num_tokens,), device="cuda")
+    labels[0] = 3
+
+    logits = base.masked_fill(banned, float("-inf"))
+    log_probs = logprobs_from_logits(logits, labels, inplace_backward=False)
+    entropy = entropy_from_logits(logits)
+    # The log-probability of a label in B is the constant -inf and is excluded from the backward pass. In
+    # training, such labels occur at prompt positions, whose log-probabilities do not enter the loss.
+    allowed_labels = ~banned[labels]
+    (log_probs[allowed_labels].sum() + entropy.sum()).backward()
+
+    # Expected values: `log_softmax` over the masked logits, and the entropy of the softmax over the logits
+    # outside B.
+    reference = base.detach().masked_fill(banned, float("-inf"))
+    expected_log_probs = reference.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    allowed_probs = reference[:, ~banned].softmax(-1)
+    expected_entropy = -(allowed_probs * allowed_probs.log()).sum(-1)
+    torch.testing.assert_close(log_probs, expected_log_probs, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(entropy, expected_entropy, atol=1e-4, rtol=1e-4)
+    assert torch.isneginf(log_probs[0])
+    assert torch.isfinite(base.grad).all()
+    assert not base.grad[:, banned].any()
 
 
 def test_expand_as_nested():

@@ -37,6 +37,7 @@ import torch
 import verl.utils.torch_functional as verl_F
 from verl.utils.device import get_device_name, get_torch_device, is_device_available
 from verl.utils.experimental.torch_functional import FusedLinearForPPO
+from verl.utils.kernel import kernels
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.torch_functional import logprobs_from_logits
 
@@ -398,6 +399,84 @@ def test_lce_non_divisible_vocab_padding():
 
         torch.testing.assert_close(ref_lp, ker_lp, atol=1e-3, rtol=1e-3, msg=f"logprob mismatch: {desc}")
         torch.testing.assert_close(ref_ent, ker_ent, atol=1e-3, rtol=1e-3, msg=f"entropy mismatch: {desc}")
+
+
+@pytest.mark.parametrize("backward_method", ["_Total_Fuse_MN", "_Total_Separate", "_Split_Dlogits_N"])
+def test_lce_banned_token_mask_matches_masked_softmax(backward_method):
+    """With a banned-token mask, the Triton kernel of `linear_cross_entropy` computes the masked softmax.
+
+    Let `z = hidden @ weight.T / temperature`, and let `z_B` equal `z` with `z_v = -inf` for every banned id
+    `v`; let `p = softmax(z_B)`. The test establishes that, for every token position `i`,
+    - the log-probability equals `log p_i(y_i)`, and is `-inf` for a banned label `y_i`,
+    - the entropy equals `-sum_v p_i(v) log p_i(v)`, where a summand with `p_i(v) = 0` is 0,
+    - the gradients w.r.t. `hidden` and `weight` are finite and equal those of the above expressions,
+      computed in float32 with autograd,
+    - the rows of the gradient w.r.t. `weight` at the banned ids are 0.
+
+    Args:
+        backward_method: The name of the `kernels.BackwardEnum` member that selects the backward kernel. The
+            test covers each implemented member; `_Split_Dlogits_M` is not implemented.
+    """
+    if not torch.cuda.is_available() or is_torch_npu_available(check_device=False):
+        pytest.skip("requires CUDA")
+
+    torch.manual_seed(0)
+    num_tokens, hidden_size, vocab_size, temperature = 777, 512, 5000, 0.7
+
+    # Test vector. The forward kernel partitions the vocabulary into splits of 1024 consecutive ids
+    # (`vocab_per_split` in `efficient_entropy_forward`) and processes each split in blocks of
+    # BLOCK_SIZE_N = 256 ids. The mask bans
+    # - all ids of the second split, 1024..2047: the maximum logit over that split is -inf, which the kernel
+    #   must handle without computing exp(-inf - (-inf)) = NaN,
+    # - the ids 5, 300 and 4097, inside splits that also contain ids that are not banned,
+    # - the ids 4900..4999, at the end of the vocabulary; 4900 is not a multiple of 256, so the first block
+    #   that contains banned ids of this range also contains ids that are not banned.
+    banned_token_mask = torch.zeros(vocab_size, dtype=torch.bool, device="cuda")
+    banned_token_mask[1024:2048] = True
+    banned_token_mask[[5, 300, 4097]] = True
+    banned_token_mask[4900:] = True
+    banned_ids = banned_token_mask.nonzero().squeeze(-1)
+
+    hidden = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda").uniform_(-0.5, 0.5)
+    weight = torch.empty(vocab_size, hidden_size, dtype=torch.bfloat16, device="cuda").uniform_(-0.5, 0.5)
+    hidden.requires_grad_()
+    weight.requires_grad_()
+    labels = torch.randint(0, vocab_size, (num_tokens,), device="cuda")
+    # The labels of the first 20 positions are banned ids, chosen uniformly at random.
+    labels[:20] = banned_ids[torch.randint(0, banned_ids.numel(), (20,), device="cuda")]
+    # The gradients of the loss w.r.t. the two outputs, applied in the backward pass.
+    g_logprobs = torch.empty(num_tokens, device="cuda").uniform_(-1, 1)
+    g_entropy = torch.empty(num_tokens, device="cuda").uniform_(-0.5, 0.5)
+
+    original_backward = kernels._config._backward
+    kernels.set_backward_method(getattr(kernels.BackwardEnum, backward_method))
+    try:
+        logprobs, entropy = linear_cross_entropy(
+            hidden, weight, labels, temperature, "none", banned_token_mask=banned_token_mask
+        )
+        torch.autograd.backward((logprobs, entropy), (g_logprobs, g_entropy))
+    finally:
+        kernels.set_backward_method(original_backward)
+
+    # Expected values: the same expressions in float32 on copies of the leaf tensors, differentiated by
+    # autograd. The entropy uses H(p) = logsumexp(z_B) - sum_v p(v) z_v, with z_v replaced by 0 at the banned
+    # ids, where p(v) = 0, because 0 * (-inf) is NaN.
+    ref_hidden = hidden.detach().float().requires_grad_()
+    ref_weight = weight.detach().float().requires_grad_()
+    logits = (ref_hidden @ ref_weight.T) / temperature
+    logits = logits.masked_fill(banned_token_mask, float("-inf"))
+    ref_logprobs = logits.log_softmax(dim=-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    probs = logits.softmax(dim=-1)
+    ref_entropy = torch.logsumexp(logits, dim=-1) - (probs * logits.masked_fill(banned_token_mask, 0.0)).sum(-1)
+    torch.autograd.backward((ref_logprobs, ref_entropy), (g_logprobs, g_entropy))
+
+    assert torch.isneginf(logprobs[:20]).all()
+    torch.testing.assert_close(logprobs, ref_logprobs, atol=1e-3, rtol=2e-4)
+    torch.testing.assert_close(entropy, ref_entropy, atol=5e-3, rtol=5e-4)
+    assert torch.isfinite(hidden.grad).all() and torch.isfinite(weight.grad).all()
+    torch.testing.assert_close(hidden.grad.float(), ref_hidden.grad, atol=1e-2, rtol=1e-4)
+    torch.testing.assert_close(weight.grad.float(), ref_weight.grad, atol=1e-2, rtol=1e-4)
+    assert not weight.grad[banned_token_mask].any()
 
 
 if __name__ == "__main__":

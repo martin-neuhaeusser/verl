@@ -22,6 +22,7 @@ import yaml
 from fastapi import FastAPI
 
 from verl.utils.tokenizer import get_processor_token_id
+from verl.utils.vocab_mask import RolloutVocabMask
 from verl.workers.config.rollout import PrometheusConfig
 
 logger = logging.getLogger(__file__)
@@ -136,6 +137,34 @@ def get_vision_placeholder_token_ids(processor) -> list[int]:
         if token_id is not None:
             token_ids.append(token_id)
     return token_ids
+
+
+def get_rollout_vocab_mask(rollout_name: str, tokenizer, processor) -> RolloutVocabMask | None:
+    """Return the set of token ids that the rollout backend ``rollout_name`` excludes from sampling.
+
+    ``vLLMHttpServer`` passes the returned set to vLLM, which sets the logits of these ids to
+    ``-inf`` before sampling. The actor and the reference model set the logits of the same ids to
+    ``-inf`` (see ``FSDPEngineWithLMHead.set_rollout_vocab_mask``).
+
+    Args:
+        rollout_name: The value of ``rollout.name`` in the trainer configuration, i.e. a key of
+            ``verl.workers.rollout.base._ROLLOUT_REGISTRY``: ``"vllm"``, ``"sglang"``, or ``"trtllm"``.
+        tokenizer: The tokenizer of the model. ``len(tokenizer)`` is the number of token ids that
+            vLLM may sample; every larger id is excluded.
+        processor: The multimodal processor of the model, or ``None`` for a text-only model. The ids
+            of its image and video placeholder tokens are excluded (see
+            :func:`get_vision_placeholder_token_ids`).
+
+    Returns:
+        The excluded set for ``"vllm"``. ``None`` for every other value of ``rollout_name``, since no
+        other rollout backend excludes token ids from sampling.
+    """
+    if rollout_name != "vllm":
+        return None
+    return RolloutVocabMask(
+        vocab_size=len(tokenizer),
+        banned_token_ids=tuple(get_vision_placeholder_token_ids(processor)),
+    )
 
 
 def extract_response_topk_logprobs(logprobs, k: int) -> tuple[list[float], np.ndarray, np.ndarray]:
